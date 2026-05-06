@@ -1,0 +1,120 @@
+---
+title: "Encodings: Pluggable Physical Representations"
+description: "Vortex's pluggable encoding system enables compressed computation. Learn about built-in encodings like FastLanes, FSST, ALP, and BtrBlocks."
+---
+
+An encoding defines how an array's data is physically stored in memory. While a [dtype](/concepts/dtypes) says _what_ the data means — for example, a 32-bit unsigned integer — an encoding says _how_ that data is laid out: flat, bit-packed, run-length encoded, dictionary-encoded, and so on.
+
+The separation between logical types and physical encodings is what makes Vortex composable. The same `u32` dtype can be stored bit-packed, frame-of-reference encoded, inside a dictionary, or in any combination of these. Encodings are a pluggable extension point: Vortex ships with a comprehensive set of built-in encodings, and third parties can register their own.
+
+## Arrow-compatible encodings
+
+The base encodings in `vortex-array` provide full zero-copy compatibility with Apache Arrow. These are the canonical encodings — the decompressed form that every other encoding eventually resolves to.
+
+<CardGroup cols={2}>
+  <Card title="PrimitiveArray" icon="binary">
+    Flat buffer of fixed-width numeric values. Direct equivalent of Arrow's primitive arrays.
+  </Card>
+  <Card title="VarBinViewArray" icon="text">
+    Variable-length binary or UTF-8 data stored using Arrow's string-view layout.
+  </Card>
+  <Card title="BoolArray" icon="toggle-on">
+    Bit-packed booleans, compatible with Arrow's boolean layout.
+  </Card>
+  <Card title="StructArray" icon="table">
+    Column-oriented struct storage. Each field is its own child array.
+  </Card>
+  <Card title="DictionaryArray" icon="book">
+    Dictionary encoding for any dtype. Values stored once; per-row codes are compact indices.
+  </Card>
+  <Card title="RunEnd" icon="repeat">
+    Run-end encoding (RLE variant) compatible with Arrow's run-end encoded arrays.
+  </Card>
+</CardGroup>
+
+## Compressed encodings
+
+The encodings in the `encodings/` directory provide state-of-the-art compression for specific data patterns. These are the building blocks that compression strategies like BtrBlocks and Compact select when writing files.
+
+### FastLanes
+
+FastLanes is a family of SIMD-optimized encodings for integer and floating-point data. All FastLanes algorithms use a transposition step that maps values to a layout where SIMD operations process data in the same bit-lane across multiple values, maximizing throughput on modern hardware.
+
+| Encoding              | Description                                                     |
+|-----------------------|-----------------------------------------------------------------|
+| `FastLanes BitPacking`| Packs integers to the minimum number of bits required           |
+| `FastLanes Delta`     | Encodes differences between consecutive values, then bit-packs  |
+| `FastLanes FoR`       | Stores values relative to a frame of reference, then bit-packs  |
+| `FastLanes RLE`       | Run-length encoding with SIMD-optimized decode                  |
+
+<Tip>
+  FastLanes BitPacking is one of the most commonly applied encodings in Vortex. For an integer column with values in a small range, it can reduce storage by 4x–8x while decoding faster than a naive loop over uncompressed data.
+</Tip>
+
+### FSST
+
+**Fast Static Symbol Table (FSST)** is a string compression encoding that builds a shared symbol table for a column of strings. Repeated byte sequences are replaced by compact 1-byte codes. FSST is particularly effective on structured strings like URLs, file paths, or log messages.
+
+A key advantage of FSST in Vortex is that query engines such as DuckDB can receive FSST-encoded string arrays directly and feed them into their own internal FSST format — skipping decompression entirely.
+
+### ALP
+
+**Adaptive Lossless Floating Point (ALP)** is a specialized encoding for floating-point columns. It exploits the observation that real-world floating-point data (such as measurements, prices, or timestamps) often has limited precision and can be converted to integers without loss. Two variants are provided:
+
+| Encoding | Description                                           |
+|----------|-------------------------------------------------------|
+| `ALP`    | General lossless floating-point compression           |
+| `ALPrd`  | Variant optimized for real doubles with high entropy  |
+
+### PCodec (PCO)
+
+**PCodec** is a compression codec for numeric data (integers and floats) that achieves high compression ratios by modeling the distribution of values. It is used by the Compact compression strategy for columns where maximum compression is preferred over decode speed.
+
+### ZigZag
+
+**ZigZag** encoding maps signed integers to unsigned integers by interleaving positive and negative values: `0 → 0`, `-1 → 1`, `1 → 2`, `-2 → 3`, and so on. This eliminates large high-bit values from negative numbers, making subsequent bit-packing much more efficient.
+
+ZigZag is typically applied as a pre-processing step before FastLanes BitPacking on signed integer columns.
+
+### Sparse
+
+**Sparse** encoding stores a single fill value and a set of patches — index/value pairs for positions that differ from the fill. It is highly efficient for columns where most values are the same (such as a status flag that is almost always `0`) and the exceptions are few.
+
+### ZStd
+
+**ZStd** applies the general-purpose Zstandard compression algorithm to binary or string data. It provides strong compression ratios at the cost of higher CPU usage during decode. Used by the Compact strategy for columns that do not benefit from domain-specific encodings.
+
+### Other encodings
+
+| Encoding          | Description                                                      |
+|-------------------|------------------------------------------------------------------|
+| `ByteBool`        | Stores booleans as single bytes rather than packed bits          |
+| `DateTimeParts`   | Decomposes timestamps into year/month/day components             |
+| `DecimalByteParts`| Decomposes fixed-precision decimals into byte components         |
+| `Sequence`        | Encodes fixed-interval arithmetic sequences compactly            |
+
+## Cascading compression
+
+Encodings compose. A single array can be the result of several encodings applied in sequence, and the array tree records the full chain. For example, a dictionary-encoded string column might look like this at rest:
+
+```text
+vortex.dict(utf8?, len=1112)
+  codes: vortex.runend(u16, len=475712)
+    ends: fastlanes.for(u32, len=981)
+      encoded: fastlanes.bitpacked(u32, len=981)
+  values: vortex.varbinview(utf8?, len=224)
+```
+
+Each layer adds compression without requiring any other layer to be aware of it. The compressor selects which cascades to apply based on statistics gathered from the data.
+
+## Compute on compressed data
+
+Vortex avoids decompressing data before performing compute wherever possible. Each encoding can register encoding-specific _kernels_ for common operations. When Vortex needs to execute a function over a compressed array, it first checks whether a kernel exists for that encoding. If one does, the operation runs directly on the compressed representation. If not, Vortex decompresses to canonical form and runs the generic implementation.
+
+<Note>
+  From the perspective of a query engine or user code, all arrays have the same interface regardless of encoding. The compressed-compute optimization is transparent — you call the same function whether the data is bit-packed or flat.
+</Note>
+
+## Pluggable encoding system
+
+Vortex's encoding system is fully pluggable. A third-party crate can define a new encoding by implementing the array vtable, registering it with a `VortexSession`, and optionally providing compute kernels. This allows domain-specific encodings — such as geospatial tile encodings or domain-specific codecs — to participate fully in the Vortex ecosystem without changes to the core library.

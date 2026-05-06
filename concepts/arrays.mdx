@@ -1,0 +1,124 @@
+---
+title: "Arrays: Compressed In-Memory Representation"
+description: "Vortex arrays can be compressed in-memory — an integer array may be bit-packed or RLE-encoded while supporting compute directly."
+---
+
+An array is the in-memory representation of data in Vortex. Unlike Apache Arrow arrays, which always store data as flat, uncompressed buffers, Vortex arrays can remain in their compressed encoding in memory. An integer array might be bit-packed; a string column might stay FSST-encoded. Compute operates on these compressed representations directly where encoding-specific kernels exist, falling back to decompression only when necessary.
+
+Structurally, each array is a tree. Every node in the tree has a length, a [dtype](/concepts/dtypes), child arrays, raw data buffers, statistics, and a vtable that encapsulates encoding-specific behavior. This tree structure is how cascading encodings — such as dictionary codes that are themselves bit-packed — are represented.
+
+## Array tree example
+
+The following output from `Array::display_tree()` shows a real compressed array tree. A single column of nullable UTF-8 strings is represented as a dictionary-encoded array, where the codes are run-end encoded and then bit-packed using FastLanes:
+
+```text
+vortex.dict(utf8?, len=1112) nbytes=11.89 kB (0.10%) [all_valid]
+  metadata: DictMetadata { values_len: 224, codes_ptype: U16 }
+  codes: vortex.slice(u16, len=1112) nbytes=3.46 kB (29.07%)
+    metadata: 474600..475712
+    child: vortex.runend(u16, len=475712) nbytes=3.46 kB (100.00%)
+      metadata: RunEndMetadata { ends_ptype: U32, num_runs: 981, offset: 0 }
+      ends: fastlanes.for(u32, len=981) nbytes=2.43 kB (70.37%) [nulls=0, min=62353u32, max=475712u32, strict]
+        metadata: 62353u32
+        encoded: fastlanes.bitpacked(u32, len=981) nbytes=2.43 kB (100.00%) [nulls=0, min=0u32, max=413359u32]
+          metadata: BitPackedMetadata { bit_width: 19, offset: 0, patches: None }
+          buffer: packed host 2.43 kB (align=4) (100.00%)
+      values: fastlanes.bitpacked(u16, len=981) nbytes=1.02 kB (29.63%) [nulls=0, min=0u16, max=223u16]
+        metadata: BitPackedMetadata { bit_width: 8, offset: 0, patches: None }
+        buffer: packed host 1.02 kB (align=2) (100.00%)
+  values: vortex.varbinview(utf8?, len=224) nbytes=8.43 kB (70.93%) [all_valid]
+    metadata: EmptyMetadata
+    buffer: buffer_0 host 4.85 kB (align=1) (57.49%)
+    buffer: views host 3.58 kB (align=16) (42.51%)
+```
+
+The original 1,112-element string column is stored in just 11.89 kB — a fraction of its uncompressed size — while remaining directly queryable.
+
+## Canonical arrays
+
+To avoid implementing compute for every possible combination of encodings, Vortex defines one **canonical encoding** per logical dtype. Any array can be fully decompressed into its canonical form. Note that canonical form only applies to the root array; child arrays may still be compressed.
+
+| DType                 | Canonical array      |
+|-----------------------|----------------------|
+| `DType::Null`         | `NullArray`          |
+| `DType::Bool`         | `BoolArray`          |
+| `DType::Primitive`    | `PrimitiveArray`     |
+| `DType::Utf8`         | `VarBinViewArray`    |
+| `DType::Binary`       | `VarBinViewArray`    |
+| `DType::Struct`       | `StructArray`        |
+| `DType::List`         | `ListViewArray`      |
+| `DType::FixedSizeList`| `FixedSizeListArray` |
+| `DType::Extension`    | `ExtensionArray`     |
+
+## Built-in arrays
+
+Alongside the canonical encodings, Vortex ships with additional built-in array types that handle common patterns and provide full zero-copy compatibility with Apache Arrow.
+
+| Array               | Description                                                |
+|---------------------|------------------------------------------------------------|
+| `ChunkedArray`      | A concatenation of multiple arrays                         |
+| `ConstantArray`     | An array where all values are the same constant            |
+| `DictionaryArray`   | Dictionary encoding for any data type                      |
+| `FilterArray`       | An array filtered by a boolean mask                        |
+| `SliceArray`        | A sliced view over another array                           |
+| `ListArray`         | Variable-length list of elements (Arrow-compatible)        |
+| `VarBinArray`       | Variable-length binary array (Arrow-compatible)            |
+
+## Compressed arrays
+
+The `encodings/` directory of the Vortex repository contains compressed array implementations maintained by the Vortex project. These are the encodings a compressor can choose from when writing data.
+
+| Encoding               | Description                                                  |
+|------------------------|--------------------------------------------------------------|
+| `ALP`                  | Adaptive Lossless Floating Point                             |
+| `ALPrd`                | Adaptive Lossless Floating Point for real doubles            |
+| `ByteBool`             | Byte-sized boolean arrays                                    |
+| `DateTimeParts`        | Decomposed date-time encoding for timestamps                 |
+| `DecimalByteParts`     | Decomposed decimal encoding                                  |
+| `FastLanes BitPacking` | SIMD-optimized bit-packed integer encoding                   |
+| `FastLanes Delta`      | SIMD-optimized delta encoding                                |
+| `FastLanes FoR`        | SIMD-optimized frame-of-reference encoding                   |
+| `FastLanes RLE`        | SIMD-optimized run-length encoding                           |
+| `FSST`                 | Fast Static Symbol Table for string compression              |
+| `PCodec`               | Compression-optimized integer and float compression          |
+| `RunEnd`               | Run-end encoding (Arrow-compatible)                          |
+| `Sequence`             | Sequence encoding for fixed-interval runs                    |
+| `Sparse`               | Fill-value plus patches for sparse data                      |
+| `ZigZag`               | Zig-zag encoding to remove negative integers                 |
+| `ZStd`                 | Binary compression using zstd                                |
+
+## Statistics
+
+Every array carries statistics that allow compute functions to short-circuit or optimize their behavior. Statistics are computed lazily and propagated through the array tree.
+
+| Statistic          | Description                                            |
+|--------------------|--------------------------------------------------------|
+| `null_count`       | Number of null values                                  |
+| `true_count`       | Number of `true` values (boolean arrays only)          |
+| `run_count`        | Number of consecutive runs                             |
+| `is_constant`      | Whether all values are the same                        |
+| `is_sorted`        | Whether values are in sorted order                     |
+| `is_strict_sorted` | Whether values are sorted and unique                   |
+| `min`              | Minimum value                                          |
+| `max`              | Maximum value                                          |
+| `uncompressed_size`| Size in memory before compression                      |
+
+These statistics are used heavily during scanning — for example, a zone's min/max values let the scan engine skip entire row ranges without reading the underlying data.
+
+## Execution
+
+The primary operation over Vortex arrays is _execution_: taking an arbitrary (possibly compressed) array tree and producing another tree that is closer to canonical form.
+
+When executing, Vortex first looks for encoding-specific kernels that can operate directly on the compressed data. If none is found, the array is decompressed to its canonical form and the operation is performed from there. This dispatch model means common operations on well-known encodings (such as comparing a bit-packed integer array against a scalar) are fast without any decompression.
+
+<Note>
+  Canonical form applies to the root of the tree only. Child arrays in a canonical array may still be in any compressed encoding.
+</Note>
+
+## Buffer handles
+
+Arrays hold their raw physical data in **buffer handles** — opaque objects that reference an underlying allocation. Buffers are device-agnostic by design, allowing Vortex arrays to live in CPU host memory or on other devices such as GPUs without changing the array interface.
+
+## Arrow compatibility
+
+Vortex is designed for zero-copy interoperability with Apache Arrow. The canonical array types are structurally compatible with their Arrow counterparts, and Arrow arrays can be imported into Vortex and exported back without copying data. This means existing Arrow-based pipelines can adopt Vortex incrementally.

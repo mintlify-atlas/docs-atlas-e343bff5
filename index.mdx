@@ -1,133 +1,137 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "Vortex: Next-Generation Columnar File Format"
+description: "Vortex is the fastest open-source columnar file format — 100x faster random access than Parquet, with zero-copy Arrow and native query engine support."
 ---
 
-## Setting up
+Vortex is an extensible, high-performance framework for columnar compression and file I/O. It combines a stable on-disk file format (`.vortex`) with a rich in-memory array ecosystem, enabling you to compress data once and query it directly — no decompression required for many operations.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Python Quickstart" icon="python" href="/quickstart/python">
+    Install vortex-data and read, write, and query Vortex files in Python in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Rust Quickstart" icon="rust" href="/quickstart/rust">
+    Add the vortex crate and get started with in-memory arrays and file I/O in Rust.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="book" href="/concepts/dtypes">
+    Understand DTypes, Arrays, Encodings, Layouts, and the Scan API.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Query Engine Integrations" icon="database" href="/integrations/datafusion">
+    Use Vortex with DataFusion, DuckDB, Spark, Polars, and Ray.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why Vortex?
 
-Everything you need to create world-class documentation.
+Vortex is designed for the next generation of data systems backed by object storage. It separates logical types from physical encodings, allowing you to store the same data in dozens of compressed formats while using a single unified API to query it.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="Blazing Fast" icon="bolt">
+    100x faster random access reads and 10–20x faster scans vs. modern Apache Parquet.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Extensible Architecture" icon="puzzle-piece">
+    Pluggable encodings, layouts, type system, and compression strategy — extend anything.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Zero-Copy Arrow" icon="arrow-right-arrow-left">
+    Seamless, zero-copy conversion to and from Apache Arrow arrays.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Stable File Format" icon="file">
+    The `.vortex` file format is stable since v0.36.0 with guaranteed backwards compatibility.
   </Card>
-</Columns>
+  <Card title="Multi-Language" icon="code">
+    First-class Rust, Python, Java, C, and C++ support.
+  </Card>
+  <Card title="Open Governance" icon="building-columns">
+    An LF AI & Data incubation project. Apache-2.0 licensed.
+  </Card>
+</CardGroup>
 
-## Make your content agent ready
+## Get started
 
-Make your docs work for humans and AI agents alike.
+<Steps>
+  <Step title="Install Vortex">
+    Install the library for your language of choice.
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+    <CodeGroup>
+    ```bash Python
+    uv add vortex-data
+    # or
+    pip install vortex-data
+    ```
+    ```bash Rust
+    cargo add vortex
+    ```
+    ```bash CLI (vx)
+    cargo binstall vortex-tui
+    ```
+    </CodeGroup>
+  </Step>
+  <Step title="Write a Vortex file">
+    Create a compressed `.vortex` file from your data.
 
-## Need inspiration?
+    <CodeGroup>
+    ```python Python
+    import vortex
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    array = vortex.array([1, 2, 3, 4, 5])
+    vortex.io.write(array, "data.vortex")
+    ```
+    ```rust Rust
+    use vortex::VortexSessionDefault;
+    use vortex::session::VortexSession;
+    use vortex::file::WriteOptionsSessionExt;
+
+    let session = VortexSession::default();
+    session.write_options()
+        .write(&mut file, array.to_array_stream())
+        .await?;
+    ```
+    </CodeGroup>
+  </Step>
+  <Step title="Read and query">
+    Open the file and scan it with filter pushdown.
+
+    <CodeGroup>
+    ```python Python
+    dataset = vortex.io.open("data.vortex")
+    result = dataset.filter(vortex.expr.column("value") > 2).to_arrow()
+    ```
+    ```rust Rust
+    let array = session
+        .open_options()
+        .open_path("data.vortex")
+        .await?
+        .scan()?
+        .with_filter(gt(root(), lit(2u64)))
+        .into_array_stream()?
+        .read_all()
+        .await?;
+    ```
+    </CodeGroup>
+  </Step>
+  <Step title="Integrate with your query engine">
+    Connect Vortex to DataFusion, DuckDB, Spark, Polars, or Ray.
+
+    See the [Query Engine Integrations](/integrations/datafusion) section to get started.
+  </Step>
+</Steps>
+
+## Explore the documentation
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="layer-group" href="/concepts/dtypes">
+    Learn how DTypes, Arrays, Encodings, Layouts, and the Scan API fit together.
+  </Card>
+  <Card title="Extending Vortex" icon="wrench" href="/extending/custom-encodings">
+    Write custom encodings, layouts, dtypes, and compute functions.
+  </Card>
+  <Card title="File Format Spec" icon="file-code" href="/spec/file-format">
+    Read the full specification for the .vortex file format.
+  </Card>
+  <Card title="Java Quickstart" icon="java" href="/quickstart/java">
+    Use Vortex with Spark, Trino, and other JVM-based engines.
+  </Card>
+</CardGroup>
+
+<Note>
+  The Vortex file format has been stable since v0.36.0. All future versions guarantee backwards compatibility — files written today will be readable by all future releases.
+</Note>

@@ -1,0 +1,90 @@
+---
+title: "Apache Spark Integration"
+description: "Read and write .vortex files from Apache Spark using the vortex-spark DataSource V2 connector, published to Maven Central as dev.vortex:vortex-spark."
+---
+
+Vortex provides a Spark DataSource V2 connector for reading and writing Vortex files. The connector is published to Maven Central as `dev.vortex:vortex-spark` and is built against Spark 4.x with Scala 2.13.
+
+## Installation
+
+<CodeGroup>
+```kotlin Gradle (Kotlin)
+implementation("dev.vortex:vortex-spark:<version>")
+```
+
+```xml Maven
+<dependency>
+    <groupId>dev.vortex</groupId>
+    <artifactId>vortex-spark</artifactId>
+    <version>${vortex.version}</version>
+</dependency>
+```
+</CodeGroup>
+
+<Note>
+  The connector ships as a shadow JAR that relocates its Arrow, Guava, and Protobuf dependencies to avoid classpath conflicts with Spark.
+</Note>
+
+## Reading Vortex files
+
+Use the `vortex` format to read a single file or a directory of Vortex files:
+
+```java
+Dataset<Row> df = spark.read()
+    .format("vortex")
+    .option("path", "/path/to/data.vortex")
+    .load();
+```
+
+When pointed at a directory, the connector discovers all `.vortex` files and creates one read partition per file. Column pruning is pushed down — only the columns referenced by the query are read from the file.
+
+### Reading from S3
+
+```java
+Dataset<Row> df = spark.read()
+    .format("vortex")
+    .option("path", "s3://bucket/path/to/data")
+    .load();
+```
+
+## Writing Vortex files
+
+```java
+df.write()
+    .format("vortex")
+    .option("path", "/path/to/output")
+    .mode(SaveMode.Overwrite)
+    .save();
+```
+
+Each Spark partition produces one output file named `part-{partitionId}-{taskId}.vortex`.
+
+### Write options
+
+| Option | Default | Description |
+|---|---|---|
+| `vortex.write.batch.size` | `2048` | Number of rows per batch (1–65536) |
+
+### Save modes
+
+The connector supports all standard Spark save modes: `Overwrite`, `Append`, `Ignore`, and `ErrorIfExists`.
+
+## Supported types
+
+| Spark type | Vortex type |
+|---|---|
+| `BooleanType` | Bool |
+| `ByteType` | Int8 / UInt8 |
+| `ShortType` | Int16 / UInt16 |
+| `IntegerType` | Int32 / UInt32 |
+| `LongType` | Int64 / UInt64 |
+| `FloatType` | Float32 |
+| `DoubleType` | Float64 |
+| `StringType` | Utf8 |
+| `BinaryType` | Binary |
+| `DecimalType` | Decimal |
+| `DateType` | Date (days) |
+| `TimestampType` | Timestamp (microseconds, UTC) |
+| `TimestampNTZType` | Timestamp (microseconds, no timezone) |
+| `ArrayType` | List |
+| `StructType` | Struct |

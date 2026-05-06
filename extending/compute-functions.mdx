@@ -1,0 +1,201 @@
+---
+title: "Writing Compute Functions"
+description: "Add custom compute kernels to Vortex using the dispatch model — implement encoding-specific kernels or rely on canonical fallbacks."
+---
+
+Vortex has a layered execution model: rather than a flat registry of compute functions keyed by operation and dtype, it uses a child-driven dispatch system built around the `VTable`. When Vortex is asked to execute an array, the encoding gets the first opportunity to handle the operation natively. If it declines, the scheduler canonicalizes the array and retries. This means encoding-specific kernels live inside the encoding's vtable, not in a separate compute function registry.
+
+<Warning>
+  This part of the Vortex documentation is still being written. The content below reflects the current source in `vortex-array/src/array/vtable/` and `vortex-array/src/kernel.rs`. For guidance not yet covered, join the [Vortex Slack](https://vortex.dev/slack) or open a [GitHub Discussion](https://github.com/vortex-data/vortex/discussions).
+</Warning>
+
+## The execution model
+
+Array execution in Vortex proceeds in three layers:
+
+1. **Reduce** (`VTable::reduce`, `VTable::reduce_parent`) — Pure structural transformations that require no I/O or buffer reads. These run eagerly and synchronously to simplify the array tree before any execution begins.
+2. **Parent kernel** (`VTable::execute_parent`, `ExecuteParentKernel`) — A child encoding intercepts an operation being performed by its parent. For example, a `RunEndArray` child of a `SliceArray` can binary-search its run-end positions rather than decoding everything.
+3. **Execute** (`VTable::execute`) — The encoding's own canonicalization logic. It may request that a child slot be canonicalized first (by returning `ExecutionResult::execute_slot`), or produce a result directly (by returning `ExecutionResult::done`).
+
+If none of the above produces a result, the scheduler falls through to a default canonical implementation.
+
+## Implementing `execute`
+
+The `execute` method on `VTable` is where your encoding decodes its data into a canonical form. It must be **iterative**, not recursive — instead of recursively canonicalizing children itself, it requests that the scheduler do so by returning `ExecutionResult::execute_slot`:
+
+```rust
+fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+    // Request that slot 0 (e.g. "values") be canonicalized first.
+    let Some(values) = array.require_slot(0, ctx)? else {
+        return Ok(ExecutionResult::execute_slot(0));
+    };
+
+    // Once we have canonical children, decode and return the result.
+    let result = my_decode(values, array.data())?;
+    Ok(ExecutionResult::done(result))
+}
+```
+
+<Tip>
+  Study `Dict::execute` in `vortex-array/src/arrays/dict/` for an example that uses `require_child!` and `require_validity!` helper macros to request multiple slots before producing a result.
+</Tip>
+
+The returned array must be logically equivalent to the input. In debug builds, Vortex verifies the returned array has the correct type, length, and nullability.
+
+## Implementing encoding-specific parent kernels
+
+Parent kernels let a child encoding intercept operations performed by a parent array type. This is useful for operations like slicing or filtering that can be handled more efficiently without full decoding.
+
+To add a parent kernel for your encoding `MyEncoding`:
+
+<Steps>
+  <Step title="Implement ExecuteParentKernel">
+    ```rust
+    use vortex_array::kernel::ExecuteParentKernel;
+    use vortex_array::arrays::Slice;
+
+    #[derive(Debug)]
+    struct MyEncodingSliceKernel;
+
+    impl ExecuteParentKernel<MyEncoding> for MyEncodingSliceKernel {
+        /// The parent array type this kernel handles.
+        type Parent = Slice;
+
+        fn execute_parent(
+            &self,
+            array: ArrayView<'_, MyEncoding>,
+            parent: ArrayView<'_, Slice>,
+            _child_idx: usize,
+            ctx: &mut ExecutionCtx,
+        ) -> VortexResult<Option<ArrayRef>> {
+            // Return Some(result) to handle the operation,
+            // or Ok(None) to decline and try the next kernel.
+            let range = parent.slice_range().clone();
+            let result = my_encoding_slice(array, range, ctx)?;
+            Ok(Some(result))
+        }
+    }
+    ```
+
+    `ExecuteParentKernel` must be implemented on a **zero-sized type**. The `#[derive(Debug)]` is required.
+  </Step>
+
+  <Step title="Register kernels in a ParentKernelSet">
+    Collect your kernels into a static `ParentKernelSet`:
+
+    ```rust
+    use vortex_array::kernel::ParentKernelSet;
+
+    pub(crate) const PARENT_KERNELS: ParentKernelSet<MyEncoding> =
+        ParentKernelSet::new(&[
+            ParentKernelSet::lift(&MyEncodingSliceKernel),
+            // Add more kernels for filter, take, compare, etc.
+        ]);
+    ```
+  </Step>
+
+  <Step title="Override execute_parent in your VTable impl">
+    Route execution to the kernel set from your `VTable` implementation:
+
+    ```rust
+    fn execute_parent(
+        array: ArrayView<'_, Self>,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    }
+    ```
+  </Step>
+</Steps>
+
+## Implementing reduce rules
+
+Reduce rules are structural-only transformations that fire before any execution. Unlike parent kernels, they cannot read buffers. They are useful for algebraic simplifications — for example, collapsing a `SliceArray` wrapping a `RunEndArray` that contains a single run into a `ConstantArray`.
+
+Override `VTable::reduce_parent` to provide reduce rules:
+
+```rust
+fn reduce_parent(
+    array: ArrayView<'_, Self>,
+    parent: &ArrayRef,
+    child_idx: usize,
+) -> VortexResult<Option<ArrayRef>> {
+    RULES.evaluate(array, parent, child_idx)
+}
+```
+
+See `encodings/runend/src/rules.rs` for examples of reduce rules implemented for `RunEndArray`.
+
+## Fallback to canonical
+
+If your encoding does not implement a parent kernel or reduce rule for a given operation, the scheduler will canonicalize your array (by calling `execute`) and retry the operation on the result. This means you only need to implement kernels for operations where the encoding can genuinely do better than decoding first.
+
+## The `OperationsVTable` sub-trait
+
+The `OperationsVTable` associated type on `VTable` provides legacy scalar access via `scalar_at`. If your encoding does not support direct scalar access, set it to `NotSupported`:
+
+```rust
+type OperationsVTable = NotSupported;
+```
+
+If you do support it, implement `OperationsVTable<MyEncoding>` for your vtable struct:
+
+```rust
+use vortex_array::vtable::OperationsVTable;
+
+impl OperationsVTable<MyEncoding> for MyEncoding {
+    fn scalar_at(
+        array: ArrayView<'_, MyEncoding>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        // Return the scalar at the given (already bounds-checked, non-null) index.
+        todo!()
+    }
+}
+```
+
+## Testing compute implementations
+
+Use `VortexResult<()>` return types and `assert_arrays_eq!` for array comparisons. For operations that depend on session execution, create a `VortexSession` with the required encodings registered:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use std::sync::LazyLock;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::session::ArraySession;
+    use vortex_session::VortexSession;
+    use vortex_error::VortexResult;
+
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+
+    #[test]
+    fn test_my_encoding_slice() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let encoded = MyEncoding::encode(input_array(), &mut ctx)?;
+        let sliced = encoded.into_array().slice(2..5)?;
+
+        // The scheduler will dispatch through execute_parent or canonicalize + retry.
+        let mut ctx = SESSION.create_execution_ctx();
+        let result = sliced.execute_as::<PrimitiveArray>("sliced", &mut ctx)?;
+        let expected = expected_slice_array();
+        assert_arrays_eq!(result, expected);
+        Ok(())
+    }
+}
+```
+
+Use `rstest` case parameterization when testing multiple input shapes or dtypes against the same operation.
+
+## Further reading
+
+- `vortex-array/src/array/vtable/mod.rs` — `VTable` trait with `execute`, `execute_parent`, `reduce`, `reduce_parent`
+- `vortex-array/src/kernel.rs` — `ExecuteParentKernel`, `ParentKernelSet`
+- `vortex-array/src/array/vtable/operations.rs` — `OperationsVTable` sub-trait
+- `encodings/runend/src/kernel.rs` — `RunEnd` parent kernels (slice, filter, take, compare)
+- `encodings/runend/src/rules.rs` — `RunEnd` reduce rules
+- [GitHub Discussions](https://github.com/vortex-data/vortex/discussions)

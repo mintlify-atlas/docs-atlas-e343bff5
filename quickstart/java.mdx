@@ -1,0 +1,164 @@
+---
+title: "Java Quickstart"
+description: "Get started with Vortex in Java using the Spark connector or standalone JNI library for high-performance columnar data access from the JVM."
+---
+
+Vortex provides two JVM integration paths: a **Spark connector** (`vortex-spark`) for reading and writing Vortex tables from Apache Spark jobs, and a lower-level **JNI library** for direct access to Vortex arrays and files from Java or Kotlin without a Spark cluster.
+
+<Warning>
+  Java support is under active development. The API surface may change between releases. For production use cases, track the [GitHub releases](https://github.com/vortex-data/vortex/releases) page for stability announcements.
+</Warning>
+
+## Spark Connector
+
+The Spark connector lets you read and write Vortex files using the standard Spark DataFrame and SQL APIs.
+
+<Steps>
+
+<Step title="Add the dependency">
+
+The connector is published to Maven Central under the `dev.vortex` group.
+
+<CodeGroup>
+
+```xml Maven
+<dependency>
+  <groupId>dev.vortex</groupId>
+  <artifactId>vortex-spark</artifactId>
+  <version>LATEST</version>
+</dependency>
+```
+
+```groovy Gradle (Groovy)
+implementation 'dev.vortex:vortex-spark:LATEST'
+```
+
+```kotlin Gradle (Kotlin DSL)
+implementation("dev.vortex:vortex-spark:LATEST")
+```
+
+</CodeGroup>
+
+<Tip>
+  Replace `LATEST` with the current version shown on [Maven Central](https://central.sonatype.com/artifact/dev.vortex/vortex-spark). You can also use the Maven badge in the [Vortex README](https://github.com/vortex-data/vortex) to get the latest published version.
+</Tip>
+
+</Step>
+
+<Step title="Write a Vortex table from Spark">
+
+Register the Vortex data source and write a DataFrame to a `.vortex` file using the `vortex` format specifier:
+
+```java
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+
+SparkSession spark = SparkSession.builder()
+    .appName("VortexExample")
+    .getOrCreate();
+
+// Read from an existing Parquet file
+Dataset<Row> df = spark.read()
+    .parquet("yellow_tripdata_2024-01.parquet");
+
+// Write as a Vortex file
+df.write()
+    .format("vortex")
+    .save("yellow_tripdata_2024-01.vortex");
+```
+
+</Step>
+
+<Step title="Read a Vortex table from Spark">
+
+Read a Vortex file back into a Spark DataFrame and run SQL queries. Filter and projection pushdown are applied automatically:
+
+```java
+Dataset<Row> vortexDf = spark.read()
+    .format("vortex")
+    .load("yellow_tripdata_2024-01.vortex");
+
+vortexDf.createOrReplaceTempView("trips");
+
+spark.sql(
+    "SELECT PULocationID, COUNT(*) AS num_trips, " +
+    "ROUND(AVG(trip_distance), 2) AS avg_distance " +
+    "FROM trips " +
+    "GROUP BY PULocationID " +
+    "ORDER BY num_trips DESC " +
+    "LIMIT 10"
+).show();
+```
+
+</Step>
+
+</Steps>
+
+## JNI Library (Standalone)
+
+For use cases that do not involve Spark—such as embedding Vortex reads inside a Java service or a custom query engine—the JNI library exposes Vortex's core array and file APIs directly.
+
+<Steps>
+
+<Step title="Add the JNI dependency">
+
+<CodeGroup>
+
+```xml Maven
+<dependency>
+  <groupId>dev.vortex</groupId>
+  <artifactId>vortex-jni</artifactId>
+  <version>LATEST</version>
+</dependency>
+```
+
+```kotlin Gradle (Kotlin DSL)
+implementation("dev.vortex:vortex-jni:LATEST")
+```
+
+</CodeGroup>
+
+</Step>
+
+<Step title="Open and read a Vortex file">
+
+The JNI library mirrors the Rust and Python APIs: open a file, create a scan, apply predicates, and read results as Arrow record batches.
+
+```java
+import dev.vortex.VortexFile;
+import dev.vortex.VortexScan;
+import org.apache.arrow.vector.ipc.ArrowReader;
+
+try (VortexFile file = VortexFile.open("example.vortex")) {
+    VortexScan scan = file.scan()
+        .withProjection("name", "age")
+        .withFilter("age > 30");
+
+    try (ArrowReader reader = scan.toArrow()) {
+        while (reader.loadNextBatch()) {
+            System.out.println(reader.getVectorSchemaRoot().contentToTSVString());
+        }
+    }
+}
+```
+
+</Step>
+
+</Steps>
+
+## Planned Features
+
+The Java integration roadmap includes:
+
+- Reading and writing Vortex files without Spark via the standalone JNI library
+- Full Apache Arrow Java integration for zero-copy data transfer
+- Apache Iceberg table format support (coming soon)
+
+Follow progress in the [vortex-data/vortex](https://github.com/vortex-data/vortex) repository or [join the community Slack](https://vortex.dev/slack) for updates.
+
+## Next Steps
+
+- [Python Quickstart](/quickstart/python) — Python bindings with scan and filter pushdown
+- [Rust Quickstart](/quickstart/rust) — native Rust API with async file IO
+- [Introduction](/introduction) — architecture overview and performance benchmarks

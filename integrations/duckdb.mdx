@@ -1,0 +1,83 @@
+---
+title: "DuckDB Integration"
+description: "Query .vortex files directly from DuckDB using the vortex-duckdb extension for zero-copy, pushdown-enabled access to compressed data."
+---
+
+Vortex is a [core extension](https://duckdb.org/docs/stable/core_extensions/vortex) shipped with DuckDB, available from DuckDB 1.4.2 and later on Linux and macOS (amd64, arm64). No separate installation step is needed beyond loading the extension.
+
+## Setup
+
+Install and load the extension inside a DuckDB session:
+
+<CodeGroup>
+```sql SQL
+INSTALL vortex;
+LOAD vortex;
+```
+
+```python Python
+import duckdb
+
+duckdb.sql("INSTALL vortex")
+duckdb.sql("LOAD vortex")
+```
+</CodeGroup>
+
+## Reading Vortex files
+
+Use the `read_vortex` table function to query a `.vortex` file:
+
+<CodeGroup>
+```sql SQL
+SELECT * FROM read_vortex('data.vortex');
+```
+
+```python Python
+import duckdb
+
+duckdb.sql("INSTALL vortex")
+duckdb.sql("LOAD vortex")
+
+result = duckdb.sql("SELECT * FROM read_vortex('data.vortex') WHERE age > 30")
+result.show()
+```
+</CodeGroup>
+
+Filters and projections are pushed down into Vortex, so only the columns and rows needed by the query are read and decompressed:
+
+```sql
+SELECT name, age
+FROM read_vortex('data.vortex')
+WHERE age > 30;
+```
+
+<Note>
+  Direct file path syntax (`SELECT * FROM 'data.vortex'`) is coming in an upcoming DuckDB release. For now, use `read_vortex(...)`.
+</Note>
+
+## Writing Vortex files
+
+Export data to Vortex using the `COPY` statement. The `FORMAT vortex` clause is required — without it, DuckDB defaults to CSV:
+
+```sql
+COPY (SELECT * FROM my_table) TO 'output.vortex' (FORMAT vortex);
+```
+
+## Extension options
+
+### `vortex_filesystem`
+
+Controls which filesystem implementation is used for reading and writing Vortex files.
+
+| Value | Description |
+|---|---|
+| `'vortex'` (default) | Uses Vortex's built-in object store filesystem. Supports `file://` and `s3://` schemes. |
+| `'duckdb'` | Uses DuckDB's built-in filesystem, including any filesystem extensions such as `httpfs`. |
+
+```sql
+SET vortex_filesystem = 'duckdb';
+```
+
+<Tip>
+  Use `'duckdb'` when you need DuckDB's filesystem extensions (for example, `httpfs` for HTTP or S3 access with DuckDB credential management). Use `'vortex'` (the default) for direct object store access via Vortex's own S3 integration, which reads credentials from environment variables.
+</Tip>

@@ -1,0 +1,150 @@
+---
+title: "VortexSession: Runtime Configuration"
+description: "VortexSession is Vortex's runtime configuration container — it holds registered DTypes, encodings, layouts, and scalar functions."
+---
+
+`VortexSession` is the runtime configuration container for the Vortex ecosystem. It is a type-indexed map that holds all extensible state — registered encodings, layouts, extension dtypes, scalar functions, and the async runtime handle. There is typically one session per process, and it is passed explicitly through the API rather than relying on global or thread-local state.
+
+Plugins can also store their own state in the session, for example to hold caches or other shared resources.
+
+## Design
+
+The session is built on two primitives from the `vortex-session` crate:
+
+- **`VortexSession`** — a cloneable, thread-safe map from Rust `TypeId` to a boxed value. Any type implementing `SessionVar` (which requires `Send + Sync + Debug + 'static`) can be stored.
+- **`Registry<T>`** — a concurrent map from string IDs to values of type `T`, used by each component to look up registered plugins at runtime.
+
+Because `VortexSession` is backed by an `Arc<DashMap>`, cloning is cheap and all clones share the same underlying state. This makes it safe to hand the session to multiple threads, async tasks, or I/O operations without any explicit coordination.
+
+```rust
+// VortexSession is Clone + Send + Sync
+let session = VortexSession::default();
+let session2 = session.clone(); // shares state, not a copy
+```
+
+## Component Registries
+
+Each Vortex crate defines a **session variable** — a type that implements `SessionVar` — that holds a registry of plugins for that component. Session variables are created lazily on first access using their `Default` implementation, which pre-populates the built-in plugins.
+
+| Session Variable | Crate | Registry Contents |
+|---|---|---|
+| `DTypeSession` | `vortex-array` | Extension dtype vtables (Date, Time, ...) |
+| `ArraySession` | `vortex-array` | Array encoding vtables (ALP, FSST, ...) |
+| `ScalarFnSession` | `vortex-array` | Scalar function vtables |
+| `LayoutSession` | `vortex-layout` | Layout encoding vtables (Flat, Chunked, ...) |
+| `RuntimeSession` | `vortex-io` | Async runtime handle |
+| `CudaSession` | `vortex-cuda` | CUDA context, compiled kernels, and stream pool |
+
+For example, `ArraySession::default()` registers the 14 built-in encodings (Null, Bool, Primitive, Struct, etc.), and `LayoutSession::default()` registers the 5 built-in layouts (Flat, Struct, Chunked, Zoned, Dict).
+
+## Constructing a Session
+
+The `VortexSession::default()` provided by the top-level `vortex` crate constructs a session with all built-in components registered:
+
+```rust
+use vortex::session::VortexSession;
+
+let session = VortexSession::default();
+```
+
+For tests or specialized use cases, a session can be assembled from individual components using the `.with::<T>()` builder method:
+
+```rust
+use vortex_session::VortexSession;
+use vortex_array::session::ArraySession;
+use vortex_layout::session::LayoutSession;
+use vortex_array::scalar::session::ScalarFnSession;
+use vortex_io::session::RuntimeSession;
+
+let session = VortexSession::empty()
+    .with::<ArraySession>()
+    .with::<LayoutSession>()
+    .with::<ScalarFnSession>()
+    .with::<RuntimeSession>();
+```
+
+<Tip>
+Use `VortexSession::empty()` in tests when you want to control exactly which encodings and layouts are available. This avoids unexpected behavior from built-in registrations and keeps tests fast and deterministic.
+</Tip>
+
+## Registering Plugins
+
+Plugins register with the session by accessing the relevant component registry and calling `register`:
+
+```rust
+// Register a custom array encoding
+session.arrays().register(MyEncoding);
+
+// Register a custom layout
+session.layouts().register(MyLayout::encoding());
+
+// Register a custom scalar function
+session.scalar_fns().register(MyScalarFnVTable);
+```
+
+Crates that bundle multiple plugins typically expose an `initialize` function that registers everything at once. The top-level `vortex` crate calls these during `VortexSession::default()` to register all built-in plugins.
+
+<Note>
+Attempting to insert a session variable type that already exists (via `.with::<T>()`) will panic. Use `.with_some(var)` to insert a pre-built variable, and avoid calling `.with::<T>()` more than once per type.
+</Note>
+
+## Explicit Session Passing
+
+Sessions are passed explicitly through constructors and method arguments. Every API that needs access to registries — file readers, writers, scan builders, layout readers — receives the session directly:
+
+```rust
+// Opening a file for reading
+session.open_options()
+    .open(reader)
+    .await?;
+
+// Writing a file
+session.write_options()
+    .write(&mut file, array_stream)
+    .await?;
+
+// Building a scan with filter pushdown
+ScanBuilder::new(session.clone(), layout_reader)
+    .with_filter(expr)
+    .into_array_stream()?;
+```
+
+Many APIs use **extension traits** to provide ergonomic methods directly on the session. For example, `OpenOptionsSessionExt` adds `.open_options()` to any session that has `ArraySession`, `LayoutSession`, and `RuntimeSession` registered. This lets the type system enforce that the required components are present before a file can be opened.
+
+## Thread Safety and Scoping
+
+`VortexSession` is `Clone + Send + Sync`. All session variable access goes through `DashMap`, which uses sharded locking to allow concurrent reads and writes. Short-lived borrows are returned as `Ref<'_, T>` and `RefMut<'_, T>` wrappers — these hold a read or write lock on the map shard for their lifetime, so they should not be held across `.await` points.
+
+Because all clones share the same `Arc<DashMap>`, a plugin registered into one clone is immediately visible through all other clones of the same session.
+
+## Unknown Plugin Policy
+
+By default, encountering an unknown encoding or layout ID during deserialization returns an error. For forward-compatibility scenarios where older readers should tolerate files written with newer encodings, the session can be configured to allow unknown plugins:
+
+```rust
+let session = VortexSession::default().allow_unknown();
+```
+
+Unknown plugins deserialize as non-executable foreign placeholders rather than failing. Attempting to decode data backed by a foreign placeholder will still return an error.
+
+## Implementing a SessionVar
+
+Any type can be stored in the session by implementing `SessionVar`:
+
+```rust
+use std::any::Any;
+use std::fmt::Debug;
+use vortex_session::SessionVar;
+
+#[derive(Debug, Default)]
+pub struct MyPluginCache {
+    // ...
+}
+
+impl SessionVar for MyPluginCache {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+}
+```
+
+Once registered, it is accessible from any clone of the session via `session.get::<MyPluginCache>()`.

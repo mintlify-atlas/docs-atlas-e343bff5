@@ -1,0 +1,133 @@
+---
+title: "IPC Wire Format for Streaming Arrays"
+description: "The Vortex IPC format streams compressed arrays between processes using FlatBuffer-framed messages — ArrayMessage, DTypeMessage, and BufferMessage types."
+---
+
+The Vortex IPC format is a lightweight framing layer for transferring compressed Vortex arrays between processes or over a network connection. It is used by the Scan API for remote interchange and by any component that needs to send or receive arrays without writing a full `.vortex` file.
+
+## Relationship to the file format
+
+The IPC format and the [file format](/spec/file-format) share the same underlying array and dtype serialization (FlatBuffers), but serve different purposes:
+
+| | File format | IPC format |
+|---|---|---|
+| **Primary use** | Persistent on-disk storage | Streaming transfer over a connection |
+| **Random access** | Yes, via layout segments | No — messages are consumed in order |
+| **Footer / postscript** | Required | Not present |
+| **Framing** | Magic bytes + postscript length | Per-message length prefix |
+| **Schema transmission** | `dtype` segment in postscript | `DTypeMessage` in the stream |
+
+## Message structure
+
+Every IPC message consists of a FlatBuffer-serialized `Message` header followed by an optional binary body. The `Message` table is defined in `vortex-flatbuffers/flatbuffers/vortex-serde/message.fbs`:
+
+```text
+// vortex-flatbuffers/flatbuffers/vortex-serde/message.fbs
+
+enum MessageVersion: uint8 {
+    V0 = 0,
+}
+
+table Message {
+    version:   MessageVersion = V0;
+    header:    MessageHeader;
+    body_size: uint64;
+}
+
+union MessageHeader {
+    ArrayMessage,
+    BufferMessage,
+    DTypeMessage,
+}
+```
+
+The `body_size` field gives the byte length of the binary body that immediately follows the FlatBuffer header in the stream. A `body_size` of zero means no body follows.
+
+## Message types
+
+<AccordionGroup>
+  <Accordion title="ArrayMessage — compressed array transfer">
+    An `ArrayMessage` indicates that the body contains a FlatBuffer-serialized `Array` followed by one or more raw data buffers.
+
+    ```text
+    table ArrayMessage {
+        row_count: uint32;
+        encodings: [string];
+    }
+    ```
+
+    - `row_count` is the number of logical rows in the array.
+    - `encodings` is the list of encoding identifiers referenced by the array nodes. These are globally unique string IDs resolved against the Vortex registry at read-time.
+
+    The body layout mirrors the in-file segment layout: the `Array` FlatBuffer is followed by the raw buffer data described by the `Array.buffers` field.
+
+    ```text
+    // vortex-flatbuffers/flatbuffers/vortex-array/array.fbs
+
+    table Array {
+        root:    ArrayNode;
+        buffers: [Buffer];
+    }
+
+    table ArrayNode {
+        encoding: uint16;
+        metadata: [ubyte];
+        children: [ArrayNode];
+        buffers:  [uint16];
+        stats:    ArrayStats;
+    }
+
+    struct Buffer {
+        padding:             uint16;
+        alignment_exponent:  uint8;
+        compression:         Compression;
+        length:              uint32;
+    }
+
+    enum Compression: uint8 {
+        None = 0,
+        LZ4  = 1,
+    }
+    ```
+
+    Each `Buffer` struct describes padding, alignment, compression, and byte length for the corresponding raw buffer in the body. Buffers within the IPC body support `None` and `LZ4` compression.
+  </Accordion>
+
+  <Accordion title="DTypeMessage — schema transmission">
+    A `DTypeMessage` indicates that the body contains a FlatBuffer-serialized `DType`. This message is sent before any `ArrayMessage` to communicate the schema of the arrays that follow.
+
+    ```text
+    table DTypeMessage {}
+    ```
+
+    The `DTypeMessage` table carries no additional fields; the schema is entirely in the body. See [DType Serialization Format](/spec/dtype-format) for the `DType` FlatBuffer schema.
+  </Accordion>
+
+  <Accordion title="BufferMessage — raw byte buffers">
+    A `BufferMessage` indicates that the body contains a plain byte buffer, not a structured array.
+
+    ```text
+    table BufferMessage {
+        alignment_exponent: uint8;
+    }
+    ```
+
+    The `alignment_exponent` field specifies the required alignment of the buffer as a power of two (`alignment = 2^alignment_exponent`).
+  </Accordion>
+</AccordionGroup>
+
+## Streaming semantics
+
+Messages are written and read sequentially. A typical stream begins with a `DTypeMessage` to establish the schema, followed by one or more `ArrayMessage` messages carrying chunks of the array. The stream ends when the underlying connection is closed or an application-level sentinel is reached.
+
+There is no end-of-stream message in the current protocol (`MessageVersion::V0`). Readers detect end-of-stream from the transport layer (e.g., EOF on a socket or channel close).
+
+<Info>
+  The current message version is `V0`. The `version` field in `Message` is reserved for future protocol evolution.
+</Info>
+
+## Usage in practice
+
+The IPC format is used internally by the Vortex Scan API when transferring arrays between a data source and an execution engine over a local or remote channel. It is also the wire format used when Vortex arrays are exchanged between language runtimes (for example, between Rust and Python via the Python bindings).
+
+Because the IPC format carries full encoding metadata in each `ArrayMessage`, a receiver can reconstruct the compressed array in memory without any additional context beyond the preceding `DTypeMessage`.

@@ -1,0 +1,217 @@
+---
+title: "Extension DTypes: Custom Logical Types"
+description: "Define custom logical types in Vortex using extension DTypes with Arrow interoperability, session registration, and serialization support."
+---
+
+Vortex's type system is built around a fixed set of primitive `DType` variants — booleans, integers, floats, strings, lists, structs, and so on. Extension DTypes let you layer a custom logical type on top of any physical storage dtype, without modifying the core type system. Built-in examples include `vortex.uuid` (backed by `FixedSizeList(U8, 16)`) and the datetime types (`vortex.date`, `vortex.time`, `vortex.timestamp`).
+
+<Warning>
+  This part of the Vortex documentation is still being written. The content below reflects the current source in `vortex-array/src/dtype/extension/`. For guidance not yet covered, join the [Vortex Slack](https://vortex.dev/slack) or open a [GitHub Discussion](https://github.com/vortex-data/vortex/discussions).
+</Warning>
+
+## The extension DType model
+
+An extension DType pairs a **logical identity** with a **physical storage dtype**. Concretely:
+
+- The **`ExtId`** is a unique namespaced string (e.g., `"vortex.uuid"`).
+- The **storage dtype** is any valid `DType` (e.g., `FixedSizeList(Primitive(U8), 16)`).
+- The **metadata** is an optional byte payload attached to every instance of the type (e.g., a UUID version constraint).
+
+Arrays of an extension type are represented at runtime using the `Extension` array encoding, which wraps any storage array and annotates it with the extension dtype.
+
+## The `ExtVTable` trait
+
+To define a new extension type, implement `ExtVTable` from `vortex_array::dtype::extension`:
+
+```rust
+pub trait ExtVTable: 'static + Sized + Send + Sync + Clone + Debug + Eq + Hash {
+    /// The deserialized form of per-type metadata.
+    type Metadata: 'static + Send + Sync + Clone + Debug + Display + Eq + Hash;
+
+    /// A native Rust value representing a non-null scalar of this type.
+    type NativeValue<'a>: Display;
+
+    /// The unique identifier for this extension type.
+    fn id(&self) -> ExtId;
+
+    /// Serialize type metadata to bytes.
+    fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>>;
+
+    /// Deserialize type metadata from bytes.
+    fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata>;
+
+    /// Validate that the given storage dtype is compatible with this extension type.
+    fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()>;
+
+    /// Unpack a native Rust value from the underlying storage scalar.
+    fn unpack_native<'a>(
+        ext_dtype: &'a ExtDType<Self>,
+        storage_value: &'a ScalarValue,
+    ) -> VortexResult<Self::NativeValue<'a>>;
+}
+```
+
+Optional methods let you control type coercion and supertype resolution:
+
+```rust
+    fn can_coerce_from(ext_dtype: &ExtDType<Self>, other: &DType) -> bool { false }
+    fn can_coerce_to(ext_dtype: &ExtDType<Self>, other: &DType) -> bool { false }
+    fn least_supertype(ext_dtype: &ExtDType<Self>, other: &DType) -> Option<DType> { None }
+```
+
+## Step-by-step: defining a custom extension type
+
+<Steps>
+  <Step title="Define your VTable struct and metadata type">
+    Create a zero-sized struct for the vtable and a metadata struct for per-instance data:
+
+    ```rust
+    use vortex_array::dtype::extension::ExtVTable;
+    use std::fmt;
+
+    /// The vtable marker type for MyType.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct MyType;
+
+    /// Per-instance metadata (e.g., precision constraints, version, etc.).
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct MyTypeMetadata {
+        pub version: Option<u8>,
+    }
+
+    impl fmt::Display for MyTypeMetadata {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self.version {
+                None => write!(f, ""),
+                Some(v) => write!(f, "v{v}"),
+            }
+        }
+    }
+    ```
+
+    If your type carries no metadata, use the provided `EmptyMetadata` helper from `vortex_array::extension`.
+  </Step>
+
+  <Step title="Choose a storage dtype">
+    Pick any `DType` to back your type's physical storage. The storage dtype is validated by `validate_dtype` whenever an `ExtDType<MyType>` is constructed. For example, a `MyType` backed by a single `u64`:
+
+    ```rust
+    use vortex_array::dtype::{DType, Nullability, PType};
+
+    fn my_type_storage_dtype(nullability: Nullability) -> DType {
+        DType::Primitive(PType::U64, nullability)
+    }
+    ```
+  </Step>
+
+  <Step title="Implement ExtVTable">
+    ```rust
+    use vortex_array::dtype::extension::{ExtDType, ExtId, ExtVTable};
+    use vortex_array::scalar::ScalarValue;
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_bail;
+
+    impl ExtVTable for MyType {
+        type Metadata = MyTypeMetadata;
+        type NativeValue<'a> = u64;
+
+        fn id(&self) -> ExtId {
+            ExtId::new("myorg.mytype")
+        }
+
+        fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
+            match metadata.version {
+                None => Ok(Vec::new()),
+                Some(v) => Ok(vec![v]),
+            }
+        }
+
+        fn deserialize_metadata(&self, bytes: &[u8]) -> VortexResult<Self::Metadata> {
+            let version = match bytes.len() {
+                0 => None,
+                1 => Some(bytes[0]),
+                other => vortex_bail!("MyType metadata must be 0 or 1 bytes, got {other}"),
+            };
+            Ok(MyTypeMetadata { version })
+        }
+
+        fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
+            let DType::Primitive(PType::U64, _) = ext_dtype.storage_dtype() else {
+                vortex_bail!(
+                    "MyType storage must be Primitive(U64), got {}",
+                    ext_dtype.storage_dtype()
+                )
+            };
+            Ok(())
+        }
+
+        fn unpack_native<'a>(
+            _ext_dtype: &'a ExtDType<Self>,
+            storage_value: &'a ScalarValue,
+        ) -> VortexResult<Self::NativeValue<'a>> {
+            let vortex_array::scalar::PValue::U64(v) = storage_value.as_primitive() else {
+                vortex_bail!("Expected U64 storage value")
+            };
+            Ok(*v)
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Construct and use the extension dtype">
+    Build an `ExtDType<MyType>` using `ExtDType::try_with_vtable` or `ExtDType::try_new`. The vtable variant calls your `validate_dtype` automatically:
+
+    ```rust
+    use vortex_array::dtype::extension::ExtDType;
+
+    let ext_dtype = ExtDType::try_with_vtable(
+        MyType,
+        MyTypeMetadata { version: Some(1) },
+        my_type_storage_dtype(Nullability::NonNullable),
+    )?;
+    ```
+
+    Wrap any storage array in the `Extension` encoding to produce a typed column:
+
+    ```rust
+    use vortex_array::arrays::ExtensionArray;
+
+    let storage = buffer![1u64, 2, 3].into_array();
+    let typed = ExtensionArray::new(ext_dtype.into(), storage);
+    ```
+  </Step>
+</Steps>
+
+## Arrow interoperability
+
+Vortex extension DTypes map to [Arrow canonical extension types](https://arrow.apache.org/docs/format/CanonicalExtensions.html) when the `ExtId` matches a registered Arrow extension name. The Arrow `ExtensionType` metadata round-trips through `serialize_metadata` / `deserialize_metadata`. Built-in types like `vortex.uuid` follow the Arrow canonical UUID extension specification exactly.
+
+For custom types, ensure your `ExtId` string matches the Arrow extension name you register on the Arrow side if you need IPC interoperability.
+
+## Serialization considerations
+
+Extension type metadata is stored in the Vortex file format as raw bytes alongside the dtype declaration. When reading a file, Vortex looks up the extension type by its `ExtId` in the session registry and calls `deserialize_metadata` to reconstruct the typed `ExtDType`.
+
+This means:
+
+- **Metadata must be stable**: changing the byte format of `serialize_metadata` will break existing files.
+- **The `ExtId` must be globally unique**: use a reverse-domain namespace (`myorg.mytype`) to avoid collisions with built-in or third-party types.
+- **Registration must happen before reading**: unregistered extension types encountered in a file are deserialized as opaque `ForeignExtDType` values. Compute functions that depend on the typed vtable will not fire.
+
+## The UUID extension type as a reference
+
+`vortex-array/src/extension/uuid/` is the canonical example of a complete extension type implementation. It shows:
+
+- Vtable struct (`Uuid`) with optional-version metadata (`UuidMetadata`)
+- Serialization to/from a single byte
+- `validate_dtype` enforcing `FixedSizeList(U8, 16)` storage
+- `unpack_native` converting the 16 storage bytes into a `uuid::Uuid`
+- Round-trip tests using `rstest` case parameterization
+
+## Further reading
+
+- `vortex-array/src/dtype/extension/vtable.rs` — full `ExtVTable` trait
+- `vortex-array/src/extension/uuid/` — UUID reference implementation
+- `vortex-array/src/extension/datetime/` — datetime extension types
+- `vortex-array/src/extension/mod.rs` — `EmptyMetadata` helper
+- [GitHub Discussions](https://github.com/vortex-data/vortex/discussions)

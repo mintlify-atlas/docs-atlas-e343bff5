@@ -1,0 +1,183 @@
+---
+title: "Vortex File Format Specification"
+description: "The .vortex file format specification — magic bytes, postscript, layout segments, footer, and backwards-compatible versioning since v0.36.0."
+---
+
+The Vortex file format is a self-describing container for serialized Vortex arrays. It is designed for efficient random-access reads from both local disk and cloud object storage, with minimal overhead when reading a small subset of columns or rows from a large file.
+
+<Note>
+  The Vortex file format has been stable since **v0.36.0**. All future versions of the Vortex library are guaranteed to be able to read files written by v0.36.0 or later.
+</Note>
+
+## Overview
+
+Most of the complexity in the file format is delegated to [Vortex Layouts](/concepts/layouts), which describe the physical arrangement of array data. The file format itself provides a thin container — magic bytes, a postscript, and a footer — that locates all layout and metadata segments within the file.
+
+Design goals for the file format include:
+
+- Backwards compatibility and (planned) forwards compatibility
+- Fine-grained encryption and compression configuration
+- Efficient access for local disk and cloud storage
+- Minimal overhead for selective column or row reads
+
+## File structure
+
+A Vortex file is laid out as follows:
+
+```text
+<4 bytes>  magic number 'VTXF'
+...        segments of binary data, optionally with inter-segment padding
+...        postscript data
+<2 bytes>  u16 version tag
+<2 bytes>  u16 postscript length
+<4 bytes>  magic number 'VTXF'
+```
+
+The file begins and ends with the 4-byte ASCII magic number `VTXF`. Immediately before the trailing magic number are two little-endian 16-bit integers: the version tag and the postscript length in bytes.
+
+This minimal footer structure means a reader can determine the location of all other data with at most two I/O round trips (see [Postscript](#postscript) below).
+
+## Postscript
+
+The postscript is a FlatBuffer-serialized `Postscript` table located at the end of the file, just before the version tag and magic bytes. Because the postscript length is encoded in the fixed-size end-of-file trailer, an initial read of 64 KB (u16::MAX bytes) from the end of the file is guaranteed to capture the entire postscript.
+
+The postscript contains the byte-range locations of four segments:
+
+1. **`dtype`** — the root `DType` FlatBuffer (the schema of the stored array)
+2. **`layout`** — the root `Layout` FlatBuffer (the physical arrangement of data)
+3. **`statistics`** — file-level per-field statistics (minima, maxima, etc., for whole-file pruning)
+4. **`footer`** — a dictionary-encoded segment map plus shared compression and encryption configuration
+
+```text
+// vortex-flatbuffers/flatbuffers/vortex-file/footer.fbs
+
+table Postscript {
+    dtype:      PostscriptSegment;
+    layout:     PostscriptSegment;
+    statistics: PostscriptSegment;
+    footer:     PostscriptSegment;
+}
+
+table PostscriptSegment {
+    offset:              uint64;
+    length:              uint32;
+    alignment_exponent:  uint8;
+    _compression:        CompressionSpec;
+    _encryption:         EncryptionSpec;
+}
+```
+
+Each `PostscriptSegment` carries its own inline compression and encryption specification so that a reader can decode that segment without first fetching the footer's shared configuration tables.
+
+<Info>
+  The postscript is guaranteed never to exceed 65,528 bytes (u16::MAX − 8), because its length field is a `u16` and the 8-byte end-of-file trailer (version + postscript length + magic) is excluded from the count.
+</Info>
+
+## Data type segment
+
+The `dtype` segment contains a FlatBuffer-serialized `DType` representing the root logical type (schema) of the stored array. This segment is separate from the footer so that large schemas can be omitted or fetched from an external source when the schema is already known to the reader.
+
+<Note>
+  Unlike many columnar formats, the root `DType` of a Vortex file is not required to be a struct. It is valid to store a `Float64` array, a `Boolean` array, or any other top-level type.
+</Note>
+
+See [DType Serialization Format](/spec/dtype-format) for details on how `DType` values are serialized.
+
+## Layout segment
+
+The `layout` segment contains a FlatBuffer-serialized `Layout` describing the physical arrangement of array data within the file's segments. `Layout` is a recursive structure:
+
+```text
+// vortex-flatbuffers/flatbuffers/vortex-layout/layout.fbs
+
+table Layout {
+    encoding: uint16;       // identifies the layout kind
+    row_count: uint64;      // rows represented by this layout
+    metadata: [ubyte];      // opaque, layout-specific metadata
+    children: [Layout];     // child layouts (recursive)
+    segments: [uint32];     // indices into footer.segment_specs
+}
+```
+
+The three built-in layout kinds are:
+
+| Encoding ID | Name       | Description                                     |
+|-------------|------------|-------------------------------------------------|
+| `1`         | `Flat`     | One buffer, zero child layouts                  |
+| `2`         | `Chunked`  | Zero buffers, one or more child layouts (rows)  |
+| `3`         | `Columnar` | Zero buffers, one or more child layouts (cols)  |
+
+Additional layout kinds can be registered at read-time via the Vortex registry.
+
+## Footer segment
+
+The `footer` segment contains a FlatBuffer-serialized `Footer` that provides dictionary-encoded tables for all segment locators, array encoding identifiers, layout identifiers, and compression and encryption schemes used in the file.
+
+```text
+// vortex-flatbuffers/flatbuffers/vortex-file/footer.fbs
+
+table Footer {
+    array_specs:       [ArraySpec];       // dictionary of array encoding IDs
+    layout_specs:      [LayoutSpec];      // dictionary of layout encoding IDs
+    segment_specs:     [SegmentSpec];     // byte-range locators for all segments
+    compression_specs: [CompressionSpec]; // dictionary of compression schemes
+    encryption_specs:  [EncryptionSpec];  // dictionary of encryption schemes
+}
+
+struct SegmentSpec {
+    offset:             uint64;  // offset from start of file
+    length:             uint32;  // length in bytes
+    alignment_exponent: uint8;   // alignment = 2^alignment_exponent
+    _compression:       uint8;   // index into compression_specs
+    _encryption:        uint16;  // index into encryption_specs
+}
+
+table ArraySpec  { id: string (required); }
+table LayoutSpec { id: string (required); }
+```
+
+Both `ArraySpec` and `LayoutSpec` carry globally unique string identifiers that are resolved against the Vortex registry at read-time.
+
+## Compression and encryption
+
+Compression and encryption are configured at the segment level, not the file level. Each `SegmentSpec` references an index into the footer's `compression_specs` and `encryption_specs` dictionaries.
+
+The supported compression schemes are:
+
+```text
+enum CompressionScheme: uint8 {
+    None  = 0,
+    LZ4   = 1,
+    ZLib  = 2,
+    ZStd  = 3,
+}
+```
+
+`EncryptionSpec` is reserved for future use and currently has no fields.
+
+## Statistics segment
+
+The `statistics` segment contains a FlatBuffer-serialized `FileStatistics` object with per-field statistics for the entire file. These statistics enable whole-file pruning without reading any data segments.
+
+```text
+table FileStatistics {
+    field_stats: [ArrayStats];
+}
+```
+
+If the root schema is not a struct, `field_stats` contains a single entry. The `ArrayStats` type is defined in `vortex-flatbuffers/flatbuffers/vortex-array/array.fbs` and includes min, max, sum, null count, sort order, and uncompressed size.
+
+## Compatibility
+
+<AccordionGroup>
+  <Accordion title="Backwards compatibility">
+    Backwards compatibility guarantees that any **older** Vortex file can be read by a **newer** version of the library. This guarantee applies to all files written by Vortex v0.36.0 or later.
+  </Accordion>
+  <Accordion title="Forward compatibility (planned)">
+    <Warning>
+      Forward compatibility is not yet implemented. It is planned to ship before the v1.0 release.
+    </Warning>
+
+    Forward compatibility will extend the stability guarantee so that **newer** Vortex files can also be read by **older** versions of the library. The plan is for writers to declare a minimum supported reader version. Encodings or layouts introduced after that minimum version will embed WebAssembly decompression logic in the file itself, allowing old readers to decompress new data without a native implementation. Newer readers will use native decompression for full performance.
+  </Accordion>
+</AccordionGroup>

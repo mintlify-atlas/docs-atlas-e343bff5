@@ -1,0 +1,300 @@
+---
+title: "Writing a Custom Encoding"
+description: "Implement a custom Vortex encoding with the VTable trait — covering serialization, deserialization, execution, and session registration in Rust."
+---
+
+Vortex arrays are physical representations of data — each encoding defines how values are stored in memory and how they are decoded back into a canonical form. Built-in encodings include run-end encoding, dictionary encoding, and FastLanes bit-packing. You can extend Vortex with your own encoding by implementing the `VTable` trait and registering it with a session.
+
+<Warning>
+  This part of the Vortex documentation is still being written. The content below reflects the current source code in `vortex-array/src/array/vtable/`. For questions or guidance not yet covered here, join the [Vortex Slack](https://vortex.dev/slack) or open a [GitHub Discussion](https://github.com/vortex-data/vortex/discussions).
+</Warning>
+
+## What is an encoding?
+
+An encoding is the unit of physical representation in Vortex. When Vortex reads an array from disk or receives one over IPC, it dispatches deserialization through the encoding registered for that array's ID. When it executes (canonicalizes) an array, it calls the encoding's `execute` method to decode values into a canonical form.
+
+Every encoding is identified by a namespaced string ID such as `"vortex.runend"`. Encodings can hold child arrays in named slots (e.g., `ends` and `values` for run-end encoding) and optional byte buffers for raw data.
+
+## The `VTable` trait
+
+The core trait to implement is `VTable` from `vortex_array::vtable`. It controls serialization, deserialization, execution (canonicalization), and child management for your encoding.
+
+```rust
+pub trait VTable: 'static + Clone + Sized + Send + Sync + Debug {
+    /// Per-array metadata stored alongside the type, dtype, and length.
+    type TypedArrayData: 'static + Send + Sync + Clone + Debug + Display + ArrayHash + ArrayEq;
+
+    /// VTable for scalar-at and other operations.
+    type OperationsVTable: OperationsVTable<Self>;
+
+    /// VTable for computing array validity.
+    type ValidityVTable: ValidityVTable<Self>;
+
+    /// The unique identifier for this encoding.
+    fn id(&self) -> ArrayId;
+
+    /// Validate that the given metadata, dtype, length, and slots are consistent.
+    fn validate(
+        &self,
+        data: &Self::TypedArrayData,
+        dtype: &DType,
+        len: usize,
+        slots: &[Option<ArrayRef>],
+    ) -> VortexResult<()>;
+
+    /// Number of raw byte buffers this encoding stores directly.
+    fn nbuffers(array: ArrayView<'_, Self>) -> usize;
+
+    /// Retrieve a buffer by index.
+    fn buffer(array: ArrayView<'_, Self>, idx: usize) -> BufferHandle;
+
+    /// Optional name for a buffer (used in debugging / IPC).
+    fn buffer_name(array: ArrayView<'_, Self>, idx: usize) -> Option<String>;
+
+    /// Serialize per-array metadata to bytes for IPC or file storage.
+    fn serialize(
+        array: ArrayView<'_, Self>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>>;
+
+    /// Reconstruct an array from serialized components.
+    fn deserialize(
+        &self,
+        dtype: &DType,
+        len: usize,
+        metadata: &[u8],
+        buffers: &[BufferHandle],
+        children: &dyn ArrayChildren,
+        session: &VortexSession,
+    ) -> VortexResult<ArrayParts<Self>>;
+
+    /// Return a name for the slot at the given index (used in debugging).
+    fn slot_name(array: ArrayView<'_, Self>, idx: usize) -> String;
+
+    /// Decode this array, returning an ExecutionResult.
+    ///
+    /// Use ExecutionResult::execute_slot to request that a child be executed first.
+    /// Use ExecutionResult::done when you can produce a result directly.
+    fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult>;
+}
+```
+
+Two sub-traits are attached via associated types:
+
+- **`OperationsVTable`** — provides `scalar_at` for indexed element access.
+- **`ValidityVTable`** — computes the `Validity` of a nullable array.
+
+## Step-by-step: writing a new encoding
+
+<Steps>
+  <Step title="Define your VTable struct and per-array data">
+    Create a zero-sized struct for the vtable and a data struct for per-array state. Use [prost](https://docs.rs/prost) to serialize metadata if it needs to be persisted.
+
+    ```rust
+    use vortex_array::vtable::VTable;
+    use vortex_session::registry::CachedId;
+
+    /// The vtable marker type for MyEncoding.
+    #[derive(Clone, Debug)]
+    pub struct MyEncoding;
+
+    /// Per-array data held alongside dtype and length.
+    #[derive(Clone, Debug)]
+    pub struct MyEncodingData {
+        pub offset: usize,
+    }
+    ```
+
+    `MyEncodingData` must implement `Display`, `ArrayHash`, and `ArrayEq` from `vortex_array`.
+  </Step>
+
+  <Step title="Implement the VTable trait">
+    Implement `VTable` for `MyEncoding`. The `id()` must return a stable, unique namespaced string. Use `CachedId` to avoid repeated string allocations.
+
+    ```rust
+    impl VTable for MyEncoding {
+        type TypedArrayData = MyEncodingData;
+        type OperationsVTable = NotSupported; // or your own impl
+        type ValidityVTable = Self;           // or MyEncoding if you impl ValidityVTable
+
+        fn id(&self) -> ArrayId {
+            static ID: CachedId = CachedId::new("myorg.myencoding");
+            *ID
+        }
+
+        fn validate(
+            &self,
+            data: &Self::TypedArrayData,
+            dtype: &DType,
+            len: usize,
+            slots: &[Option<ArrayRef>],
+        ) -> VortexResult<()> {
+            // Check that children are present and types match
+            Ok(())
+        }
+
+        fn nbuffers(_array: ArrayView<'_, Self>) -> usize { 0 }
+
+        fn buffer(_array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
+            vortex_panic!("no buffers")
+        }
+
+        fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
+            None
+        }
+
+        fn serialize(
+            array: ArrayView<'_, Self>,
+            _session: &VortexSession,
+        ) -> VortexResult<Option<Vec<u8>>> {
+            // Encode your metadata using prost or similar
+            Ok(Some(vec![]))
+        }
+
+        fn deserialize(
+            &self,
+            dtype: &DType,
+            len: usize,
+            metadata: &[u8],
+            _buffers: &[BufferHandle],
+            children: &dyn ArrayChildren,
+            _session: &VortexSession,
+        ) -> VortexResult<ArrayParts<Self>> {
+            // Reconstruct children and return ArrayParts
+            let child = children.get(0, dtype, len)?;
+            let slots = vec![Some(child)];
+            let data = MyEncodingData { offset: 0 };
+            Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data)
+                .with_slots(slots))
+        }
+
+        fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
+            ["values"][idx].to_string()
+        }
+
+        fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+            // Decode and return the canonical form.
+            // Use ExecutionResult::execute_slot(idx) to request a child first,
+            // or ExecutionResult::done(result) to return directly.
+            let child = array.slots()[0]
+                .as_ref()
+                .vortex_expect("child slot")
+                .clone();
+            Ok(ExecutionResult::done(child))
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Implement ValidityVTable">
+    If your encoding is nullable, implement `ValidityVTable<MyEncoding>` for `MyEncoding` (or a helper type):
+
+    ```rust
+    use vortex_array::vtable::ValidityVTable;
+    use vortex_array::validity::Validity;
+
+    impl ValidityVTable<MyEncoding> for MyEncoding {
+        fn validity(array: ArrayView<'_, MyEncoding>) -> VortexResult<Validity> {
+            // Delegate to a child that holds validity,
+            // or return AllValid / NonNullable as appropriate.
+            array.slots()[0]
+                .as_ref()
+                .vortex_expect("child")
+                .validity()
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Register parent kernels (optional)">
+    If your encoding can intercept operations performed by a parent array (e.g., slicing a run-end encoded child), implement `ExecuteParentKernel` and register it in a `ParentKernelSet`. Return `Ok(None)` to decline and fall through to the next kernel.
+
+    ```rust
+    use vortex_array::kernel::{ExecuteParentKernel, ParentKernelSet};
+
+    #[derive(Debug)]
+    struct MySliceKernel;
+
+    impl ExecuteParentKernel<MyEncoding> for MySliceKernel {
+        type Parent = Slice; // the parent array type this handles
+
+        fn execute_parent(
+            &self,
+            array: ArrayView<'_, MyEncoding>,
+            parent: ArrayView<'_, Slice>,
+            _child_idx: usize,
+            ctx: &mut ExecutionCtx,
+        ) -> VortexResult<Option<ArrayRef>> {
+            // Return Some(result) or Ok(None) to decline
+            Ok(None)
+        }
+    }
+
+    pub(crate) const PARENT_KERNELS: ParentKernelSet<MyEncoding> =
+        ParentKernelSet::new(&[ParentKernelSet::lift(&MySliceKernel)]);
+    ```
+
+    Then override `execute_parent` in your `VTable` impl:
+
+    ```rust
+    fn execute_parent(
+        array: ArrayView<'_, Self>,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    }
+    ```
+  </Step>
+
+  <Step title="Register with a session">
+    Vortex encodings are registered per session through `ArraySession`. Call `register` before decoding arrays with your encoding:
+
+    ```rust
+    use vortex_array::session::ArraySession;
+    use vortex_session::VortexSession;
+
+    let session = VortexSession::empty()
+        .with::<ArraySession>();
+
+    session.arrays().register(MyEncoding);
+    ```
+
+    For the default session used in tests (`LEGACY_SESSION`), registrations are global. For production use, build a session explicitly and pass it through your pipeline.
+  </Step>
+</Steps>
+
+## Testing your encoding
+
+Use `assert_arrays_eq!` for array comparisons and `VortexResult<()>` return types in tests. A minimal round-trip test pattern:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use vortex_array::{IntoArray, VortexSessionExecute, assert_arrays_eq};
+    use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+
+    #[test]
+    fn roundtrip() -> VortexResult<()> {
+        // Build your encoded array
+        let encoded = MyEncoding::encode(buffer![1i32, 1, 2, 3].into_array())?;
+
+        // Canonicalize via session execution
+        let mut ctx = SESSION.create_execution_ctx();
+        let canonical = encoded.into_array().execute_as::<PrimitiveArray>("test", &mut ctx)?;
+
+        let expected = buffer![1i32, 1, 2, 3].into_array();
+        assert_arrays_eq!(canonical, expected);
+        Ok(())
+    }
+}
+```
+
+## Further reading
+
+- `vortex-array/src/array/vtable/mod.rs` — full `VTable` trait definition
+- `encodings/runend/src/array.rs` — `RunEnd` encoding as a complete reference implementation
+- `encodings/fastlanes/src/` — FastLanes bit-packing and delta encodings
+- [GitHub Discussions](https://github.com/vortex-data/vortex/discussions) — ask questions about the encoding model

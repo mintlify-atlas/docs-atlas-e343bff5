@@ -1,0 +1,97 @@
+---
+title: "Vortex: Columnar Compression Framework Overview"
+description: "Vortex is a next-generation columnar file format offering 100x faster random access than Parquet, extensible encodings, and zero-copy Arrow integration."
+---
+
+Vortex is a next-generation columnar file format and toolkit designed for high-performance data processing on object storage. It provides a clean separation between logical types and physical encodings, allowing query engines and storage systems to apply optimal compression schemes per column—without sacrificing read speed. Vortex integrates natively with Apache Arrow, DataFusion, DuckDB, Spark, Pandas, and Polars.
+
+<Note>
+  The Vortex file format has been **stable since v0.36.0**. All future releases guarantee backwards compatibility—any file written by Vortex 0.36.0 or later will be readable by newer versions. Library APIs may still evolve between releases.
+</Note>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="100x Faster Random Access" icon="bolt">
+    Vortex delivers up to 100x faster random access reads compared to modern Apache Parquet, thanks to efficient support for wide tables with zero-copy, zero-parse metadata.
+  </Card>
+  <Card title="10–20x Faster Scans" icon="gauge-high">
+    Full-column scans run 10–20x faster than Parquet, enabled by optimized compute kernels that operate directly on compressed data without full decompression.
+  </Card>
+  <Card title="5x Faster Writes" icon="pen-to-square">
+    Writing data to Vortex is up to 5x faster than Parquet while achieving similar compression ratios, making it practical as a hot-path storage format.
+  </Card>
+  <Card title="Similar Compression Ratios" icon="file-zipper">
+    Vortex matches Parquet's compression ratios using a pluggable cascading compression system, including BtrBlocks, RLE, dictionary encoding, ALP, FSST, and more.
+  </Card>
+  <Card title="Zero-Copy Arrow Integration" icon="arrows-left-right">
+    Built-in encodings are fully compatible with Apache Arrow's memory format. Convert to and from Arrow arrays with zero copies using `vx.array()` and `.to_arrow()`.
+  </Card>
+  <Card title="Extensible Architecture" icon="puzzle-piece">
+    Modeled after Apache DataFusion's plugin system: encodings, type systems, compression strategies, and layout strategies are all swappable without forking the library.
+  </Card>
+</CardGroup>
+
+## Architecture: Logical vs. Physical Layers
+
+Vortex strictly separates logical concerns (what the data means) from physical concerns (how the data is stored). This design enables engines to choose the best encoding for each column independently.
+
+**Logical Layer**
+
+The logical layer defines data types and schema. Vortex's type system (`DType`) covers primitives, structs, lists, strings, timestamps, and extension types. The logical type is what query engines and users interact with—it never changes regardless of how the data is physically compressed.
+
+**Physical Layer**
+
+The physical layer handles encoding and storage. Built-in encodings match Apache Arrow's in-memory format for zero-copy interoperability. Extension encodings implement compressed schemes such as:
+
+- **RLE** — Run-length encoding for repeated values
+- **Dictionary** — Dictionary encoding for low-cardinality columns
+- **FastLanes** — High-throughput bit-packing and frame-of-reference for integers
+- **ALP / G-ALP** — Adaptive lossless floating-point compression
+- **FSST** — Fast random-access string compression
+- **BtrBlocks** — Cascading columnar compression, the default for file writes
+
+Because compute kernels operate on encoded arrays directly, many operations avoid a full decompression step—this is the source of Vortex's scan and random-access speed advantage.
+
+## Performance Benchmarks
+
+The following numbers compare Vortex against modern Apache Parquet across representative workloads:
+
+| Operation | Vortex vs. Parquet |
+|---|---|
+| Random access reads | Up to **100x faster** |
+| Full column scans | **10–20x faster** |
+| Writes | **5x faster** |
+| Compression ratio | Similar |
+
+Live, continuously-updated benchmarks are published at [bench.vortex.dev](https://bench.vortex.dev).
+
+## Integrations
+
+Vortex works with the tools already in your stack:
+
+- **Query engines**: Apache DataFusion, DuckDB
+- **Runtimes**: Apache Spark (via JNI connector)
+- **DataFrame libraries**: Pandas, Polars
+- **Memory format**: Apache Arrow (zero-copy)
+- **Coming soon**: Apache Iceberg
+
+## Open Source and Governance
+
+Vortex is a [Linux Foundation AI & Data](https://lfaidata.foundation/) sub-project, licensed under Apache-2.0. It is not controlled by any single company. The governance model is documented in [CONTRIBUTING.md](https://github.com/vortex-data/vortex/blob/main/CONTRIBUTING.md) and governed by the [Technical Charter](https://vortex.dev/charter.pdf).
+
+## Get Started
+
+Choose your language to start reading and writing Vortex files in minutes:
+
+<CardGroup cols={3}>
+  <Card title="Python Quickstart" icon="python" href="/quickstart/python">
+    Install `vortex-data`, write arrays to `.vortex` files, and query them with filter and projection pushdown.
+  </Card>
+  <Card title="Rust Quickstart" icon="rust" href="/quickstart/rust">
+    Add the `vortex` crate, create a `VortexSession`, and read/write compressed files with async Tokio.
+  </Card>
+  <Card title="Java Quickstart" icon="java" href="/quickstart/java">
+    Use the Spark connector or standalone JNI library to access Vortex files from the JVM.
+  </Card>
+</CardGroup>

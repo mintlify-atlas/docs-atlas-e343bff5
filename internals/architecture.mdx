@@ -1,0 +1,143 @@
+---
+title: "Crate Architecture and Repository Layout"
+description: "Vortex is a Rust monorepo with separate crates for arrays, encodings, layouts, file I/O, and DataFusion, DuckDB, and Spark integrations."
+---
+
+Vortex is a Rust monorepo for columnar array processing, compression encodings, and file I/O. The workspace is divided into four main groups — core crates, encodings, language bindings, and query engine integrations — each with a well-defined role and dependency boundary.
+
+<Note>
+All external consumers and third-party encoding authors should depend only on the top-level `vortex` crate. It re-exports everything they need and shields them from internal crate boundaries that may change across releases.
+</Note>
+
+## The `vortex` Crate
+
+The `vortex` crate is the single entry point for external consumers. It re-exports types from `vortex-array`, `vortex-file`, `vortex-scan`, and the standard encodings, and calls each encoding's `initialize` function during `VortexSession::default()`.
+
+This single-dependency design provides:
+
+- A **stable API surface** that does not expose internal crate boundaries.
+- **Freedom to refactor** internal crate splits without breaking downstream code.
+- **Consistent versioning** across the entire encoding and file ecosystem.
+
+Third-party encodings implement their vtables against types re-exported from `vortex`, and query engine integrations build on the file reading and scan APIs exposed through it.
+
+## Core Crates
+
+The core crates provide the foundation for the Vortex type system, array representation, file format, and I/O.
+
+<AccordionGroup>
+  <Accordion title="Error handling and buffers">
+    | Crate | Role |
+    |---|---|
+    | `vortex-error` | `VortexError` and `VortexResult<T>` types; `vortex_err!` / `vortex_bail!` macros |
+    | `vortex-buffer` | Zero-copy aligned `Buffer<T>` and `BufferMut<T>`, guaranteed aligned to `T` or a requested runtime alignment |
+    | `vortex-mask` | Bitmask operations for validity and selection |
+  </Accordion>
+  <Accordion title="Type system and arrays">
+    | Crate | Role |
+    |---|---|
+    | `vortex-array/src/dtype` | `DType` enum: Null, Bool, Primitive, UTF8, Binary, Struct, List, Extension |
+    | `vortex-array/src/scalar` | Single-value representations of each dtype |
+    | `vortex-array` | Core `Array` trait, canonical encodings, vtable dispatch system, statistics |
+    | `vortex-expr` | Expression representation and optimization |
+  </Accordion>
+  <Accordion title="Session, I/O, and file format">
+    | Crate | Role |
+    |---|---|
+    | `vortex-session` | Session object holding registries for encodings, layouts, and extension types |
+    | `vortex-io` | Async I/O abstraction (local filesystem, object store, HTTP) |
+    | `vortex-layout` | Layout traits and built-in layouts (Flat, Struct, Chunked, Zoned, Dict) |
+    | `vortex-ipc` | IPC format for inter-process communication |
+    | `vortex-flatbuffers` | FlatBuffer schema definitions for arrays, layouts, footers, and IPC messages |
+    | `vortex-file` | `.vortex` file reading and writing via `LayoutReader` |
+    | `vortex-scan` | Table scan with filter and projection pushdown |
+  </Accordion>
+</AccordionGroup>
+
+## Dependency Order
+
+The crates form a strict dependency DAG. Building from the bottom up:
+
+```text
+vortex-error
+  └── vortex-buffer
+        └── vortex-array  (includes dtype, scalar, vtable system)
+              ├── vortex-session
+              ├── vortex-io
+              ├── vortex-layout
+              ├── vortex-file
+              ├── vortex-scan
+              └── encodings/*
+```
+
+`vortex-session` depends on `vortex-array` for `ArraySession` and `DTypeSession`, and `vortex-io` adds `RuntimeSession`. Crates higher in the stack are never imported by those below them.
+
+## Encodings
+
+Each encoding lives in its own crate under `encodings/`, implements the array vtable, and registers itself with the session. The standard set is bundled into the top-level `vortex` crate.
+
+| Crate | Technique |
+|---|---|
+| `vortex-alp` | Adaptive Lossless floating-Point compression |
+| `vortex-fastlanes` | FastLanes bit-packing, delta, and frame-of-reference |
+| `vortex-fsst` | Fast Static Symbol Table compression for strings |
+| `vortex-runend` | Run-end encoding for repetitive data |
+| `vortex-sparse` | Sparse array encoding |
+| `vortex-zigzag` | ZigZag encoding for signed integers |
+| `vortex-roaring` | Roaring bitmap encoding |
+| `vortex-dict` | Dictionary encoding |
+| `vortex-bytebool` | Byte-per-boolean encoding |
+| `vortex-datetime-parts` | DateTime field decomposition |
+| `vortex-decimal-byte-parts` | Decimal byte decomposition |
+| `vortex-sequence` | Arithmetic sequence encoding |
+
+## Language Bindings
+
+Vortex exposes a tiered API surface to non-Rust languages. Each tier is a strict superset of the one below it, ranging from basic Arrow I/O (Tier 0) through native array access (Tier 2) to full plugin registration (Tier 3).
+
+<CardGroup cols={2}>
+  <Card title="Python (PyO3)" icon="python">
+    `vortex-python/` — Python bindings via [PyO3](https://pyo3.rs) and Maturin. Currently near Tier 2: native expressions, array inspection, and Arrow export. Tier 3 (plugin registration) is planned.
+  </Card>
+  <Card title="C FFI (cbindgen)" icon="c">
+    `vortex-ffi/` — C API generated via cbindgen. This is the **foundation ABI** for all non-Rust bindings. Not yet ABI-stable; should be statically linked. Target: Tier 2.
+  </Card>
+  <Card title="C++ wrapper" icon="code">
+    `vortex-cxx/` — Higher-level C++ RAII wrapper around the C FFI. CMake integration. The plan is to migrate from cxx to wrapping the C API directly. Target: Tier 2.
+  </Card>
+  <Card title="Java (JNI)" icon="java">
+    `java/vortex-jni/` — JNI bindings for broad JDK compatibility. Used by Spark and Trino connectors. Target: Tier 1. A separate Panama FFI path targeting Tier 2 is planned for JDK 22+.
+  </Card>
+</CardGroup>
+
+## Query Engine Integrations
+
+| Crate / Directory | Engine | Notes |
+|---|---|---|
+| `vortex-datafusion/` | DataFusion | `TableProvider` and `FileFormat` integration |
+| `vortex-duckdb/` | DuckDB | Table function integration using `CurrentThreadRuntime` |
+| `java/vortex-spark_{2.12,2.13}/` | Spark | DataSource V2 connector via JNI |
+| `java/vortex-trino/` | Trino | Connector in development |
+
+## Other Crates
+
+| Crate | Role |
+|---|---|
+| `vortex-cuda` | GPU-accelerated decompression and compute (Linux only) |
+| `vortex-tui` | Terminal UI for inspecting Vortex files |
+| `vortex-bench` | Benchmark harness and data generators |
+
+## Building a Single Crate
+
+When iterating on a specific crate, prefer narrow builds to keep feedback loops fast:
+
+```bash
+cargo build -p vortex-array
+cargo nextest run -p vortex-array
+```
+
+Use workspace-wide builds only when a change spans crate boundaries:
+
+```bash
+cargo build --workspace
+```

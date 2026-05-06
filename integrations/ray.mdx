@@ -1,0 +1,83 @@
+---
+title: "Ray Integration"
+description: "Use VortexDatasource with Ray Data to read compressed .vortex files in distributed pipelines with column projection and predicate pushdown across the cluster."
+---
+
+Vortex provides a `VortexDatasource` for Ray Data that reads `.vortex` files in distributed Ray pipelines. Each file in a directory becomes a read partition, and the datasource supports column projection and filter pushdown to minimize I/O across the cluster.
+
+## Installation
+
+```bash
+pip install vortex-data ray[data]
+```
+
+## Reading Vortex files with Ray
+
+<Steps>
+  <Step title="Write some Vortex files">
+    Prepare one or more `.vortex` files in a directory. Each file will become a read partition in Ray:
+
+    ```python
+    import vortex as vx
+    import pyarrow.parquet as pq
+    import os
+
+    os.makedirs("ray_data", exist_ok=True)
+    table = pq.read_table("example.parquet")
+
+    vx.io.write(table, 'ray_data/example-01.vortex')
+    vx.io.write(table, 'ray_data/example-02.vortex')
+    vx.io.write(table, 'ray_data/example-03.vortex')
+    ```
+  </Step>
+
+  <Step title="Create a Ray dataset from Vortex files">
+    Use `VortexDatasource` with `read_datasource` to create a distributed Ray dataset:
+
+    ```python
+    from vortex.ray.datasource import VortexDatasource
+    from ray.data import read_datasource
+
+    ds = read_datasource(VortexDatasource(url='ray_data'))
+    df = ds.to_pandas()
+    ```
+  </Step>
+</Steps>
+
+## Column projection and filtering
+
+`VortexDatasource` accepts optional `columns` and `filter` arguments to push projection and predicate evaluation into the scan, reducing the amount of data read across the cluster:
+
+```python
+import vortex.expr as ve
+from vortex.ray.datasource import VortexDatasource
+from ray.data import read_datasource
+
+ds = read_datasource(
+    VortexDatasource(
+        url='ray_data',
+        columns=['name', 'age'],
+        filter=ve.column('age') > 30,
+    )
+)
+```
+
+## VortexDatasource reference
+
+`VortexDatasource` accepts the following constructor arguments:
+
+| Argument | Type | Description |
+|---|---|---|
+| `url` | `str` | Path to a directory of `.vortex` files |
+| `columns` | `list[str] \| None` | Columns to project. Reads all columns if omitted. |
+| `filter` | `pc.Expression \| VortexExpr \| None` | Predicate to push into the scan |
+| `batch_size` | `int \| None` | Maximum number of rows per batch |
+| `meta_provider` | `BaseFileMetadataProvider` | Custom metadata provider for file discovery |
+
+## Distributed processing
+
+`VortexDatasource` sets `supports_distributed_reads = True`, which means Ray will schedule read tasks across the cluster rather than concentrating all reads on the driver node. The parallelism is controlled by the `parallelism` argument passed to `read_datasource`, and files are distributed across tasks as evenly as possible.
+
+<Note>
+  Ray does not start correctly inside a `uv run` environment. If you are running Ray locally for development, activate your virtual environment with `source .venv/bin/activate` before starting Ray.
+</Note>

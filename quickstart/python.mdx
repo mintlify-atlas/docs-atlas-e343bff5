@@ -1,0 +1,182 @@
+---
+title: "Python Quickstart"
+description: "Learn how to install the vortex-data Python package and write, read, and query .vortex files with filter and projection pushdown in a few lines of code."
+---
+
+The `vortex-data` package provides Python bindings for reading and writing Vortex files, constructing arrays from Python objects or Apache Arrow tables, and querying data with filter and projection pushdown. It integrates with PyArrow, Pandas, and Polars out of the box.
+
+<Steps>
+
+<Step title="Install vortex-data">
+
+Install the package using `uv` (recommended) or `pip`:
+
+<CodeGroup>
+
+```bash uv
+uv add vortex-data
+```
+
+```bash pip
+pip install vortex-data
+```
+
+</CodeGroup>
+
+Verify the install by checking the version:
+
+```python
+import vortex as vx
+print(vx.__version__)
+```
+
+<Tip>
+  The `vortex-data` package also ships the `vx` command-line tool. After installing, run `vx --help` to explore, inspect, and query Vortex files from the terminal.
+</Tip>
+
+</Step>
+
+<Step title="Create an array and write it to a file">
+
+Use `vx.array()` to construct a Vortex array from a Python list of dicts, then write it to disk with `vx.io.write()`:
+
+```python
+import vortex as vx
+
+# Construct a Vortex array from Python objects
+a = vx.array([
+    {'name': 'Joseph',  'age': 25},
+    {'name': None,      'age': 31},
+    {'name': 'Angela',  'age': None},
+    {'name': 'Mikhail', 'age': 57},
+    {'name': None,      'age': None},
+])
+
+# Write the array to a .vortex file
+vx.io.write(a, "people.vortex")
+```
+
+`vx.array()` accepts Python lists, Apache Arrow arrays, and Arrow-compatible objects (including Pandas DataFrames and PyArrow tables). The file is written with BtrBlocks compression applied automatically.
+
+</Step>
+
+<Step title="Read and filter with the scan API">
+
+Open a Vortex file with `vx.open()`, then call `.scan()` to read it back. Scans support **filter pushdown** via expressions and **projection pushdown** via an explicit column list—only the requested columns and rows are read from disk.
+
+```python
+import vortex as vx
+import vortex.expr as ve
+
+vxf = vx.open("people.vortex")
+
+# Read all rows and all columns
+all_rows = vxf.scan().read_all()
+print(all_rows.to_arrow_array())
+
+# Project: read only the 'age' column
+ages = vxf.scan(['age']).read_all()
+print(ages.to_arrow_array())
+
+# Filter: keep only rows where age > 35
+# Only O(N_KEPT) rows are decoded when the file format allows
+filtered = vxf.scan(expr=ve.column("age") > 35).read_all()
+print(filtered.to_arrow_array())
+```
+
+You can combine projection and filtering in a single scan:
+
+```python
+# Read only 'name' for rows where age > 35
+result = vxf.scan(['name'], expr=ve.column("age") > 35).read_all()
+```
+
+<Note>
+  The filter columns do not need to appear in the projection. Vortex reads the filter column from disk to evaluate the predicate, then returns only the projected columns for matching rows.
+</Note>
+
+**Targeted random access with row indices**
+
+If you have an external index that identifies specific rows, pass a sorted, non-null `vx.array` of row indices to skip all non-matching IO:
+
+```python
+import vortex as vx
+
+vxf = vx.open("people.vortex")
+
+# Row indices must be sorted and unique
+indices = vx.array([1, 2, 10])
+result = vxf.scan(indices=indices).read_all()
+assert len(result) == 3
+```
+
+**Repeated scans**
+
+For workloads that execute the same scan many times (e.g., serving row ranges from an index), use `to_repeated_scan()` to prepare the scan once and execute it many times efficiently:
+
+```python
+import vortex as vx
+import vortex.expr as ve
+
+vxf = vx.open("people.vortex")
+scan = vxf.to_repeated_scan(expr=ve.column("age") > 20)
+
+# Execute the same prepared scan over different row ranges
+batch_a = scan.execute(row_range=(0, 2)).read_all()
+batch_b = scan.execute(row_range=(2, 5)).read_all()
+```
+
+</Step>
+
+<Step title="Convert from Parquet">
+
+Use PyArrow to read a Parquet file and convert it to a Vortex array with `vx.array()`:
+
+```python
+import pyarrow.parquet as pq
+import vortex as vx
+
+# Read the Parquet file into an Arrow table
+parquet_table = pq.read_table("yellow_tripdata_2024-01.parquet")
+
+# Wrap the Arrow table as an uncompressed Vortex array
+vtx = vx.array(parquet_table)
+print(f"Uncompressed size: {vtx.nbytes} bytes")
+
+# Write it out as a compressed Vortex file
+vx.io.write(vtx, "yellow_tripdata_2024-01.vortex")
+```
+
+<Tip>
+  For large files, the `vx` CLI is often more convenient: `vx convert yellow_tripdata_2024-01.parquet`. It converts in one command and reports compression statistics.
+</Tip>
+
+</Step>
+
+</Steps>
+
+## Read as Arrow, Pandas, or Polars
+
+`VortexFile` supports multiple output formats without extra copies:
+
+```python
+import vortex as vx
+
+vxf = vx.open("people.vortex")
+
+# As a PyArrow RecordBatchReader (streaming)
+arrow_reader = vxf.to_arrow()
+
+# As a PyArrow Dataset (compatible with DataFusion, DuckDB)
+dataset = vxf.to_dataset()
+
+# As a Polars LazyFrame (with predicate and column pushdown)
+lf = vxf.to_polars()
+df = lf.filter(lf.schema["age"] > 30).collect()
+```
+
+## Next Steps
+
+- [Rust Quickstart](/quickstart/rust) — use Vortex from Rust with async file IO
+- [Java Quickstart](/quickstart/java) — Spark connector and JNI bindings
+- [Introduction](/introduction) — architecture overview and performance benchmarks

@@ -1,0 +1,98 @@
+---
+title: "Layouts: On-Disk Data Organization"
+description: "Vortex layouts organize arrays into larger-than-memory datasets with efficient column access from any block storage or object store."
+---
+
+Layouts are the out-of-memory equivalent of [Vortex arrays](/concepts/arrays). Where an array is the in-memory, immediately accessible representation of data, a layout is a serializable, hierarchical description of how that data is organized in storage. Layouts are lazy: their data buffers — called _segments_ — are not loaded until explicitly requested.
+
+Like arrays, layouts are tree-structured. Each node in the tree has an associated vtable, metadata, dtype, child layouts, and lazy buffer references. This structure can be serialized and persisted to any block storage backend. During deserialization, the layout is bound to a _segment source_ — an abstraction that can lazily fetch data from local disk, an object store, a remote cache, or any other addressable storage medium.
+
+<Note>
+  The [Vortex file format](/concepts/scanning) is a serialized layout tree with the data segments stored in the same file. Layouts and the file format are the same concept viewed from different angles.
+</Note>
+
+## Built-in layouts
+
+Vortex provides a set of built-in layout types, each designed for a specific organizational role. Users can also define custom layouts.
+
+<AccordionGroup>
+  <Accordion title="FlatLayout">
+    The leaf node of the layout tree. A `FlatLayout` holds a single serialized Vortex array — any encoding, any dtype. When a reader needs the data, the flat layout fetches its segment and deserializes the array.
+  </Accordion>
+
+  <Accordion title="StructLayout">
+    A `StructLayout` holds a collection of named child layouts corresponding to the fields of a `StructDType`. Each field's data is stored in its own child layout, enabling column-level access: reading a single field only fetches that field's segments, not the entire row.
+  </Accordion>
+
+  <Accordion title="ChunkedLayout">
+    A `ChunkedLayout` holds a sequence of row-wise partitioned child layouts. It is the layout-level equivalent of a `ChunkedArray`. Row groups, pages, and other chunking schemes are all expressed as `ChunkedLayout` nodes at the appropriate level of the tree.
+  </Accordion>
+
+  <Accordion title="DictionaryLayout">
+    A `DictionaryLayout` stores a shared dictionary of values together with a child layout holding per-row index codes. This enables dictionary compression to be applied across layout boundaries, sharing a single value set across many chunks.
+  </Accordion>
+
+  <Accordion title="ZonedLayout">
+    A `ZonedLayout` stores a zone-map of statistics alongside its data child. These statistics — typically min, max, null count, and sort order — are used during scanning to prune entire zones without reading the underlying data. A zone typically covers a fixed number of rows (e.g., 8,192 rows per zone).
+  </Accordion>
+</AccordionGroup>
+
+## Composing layouts
+
+Layouts are meant to be composed. Any layout can contain any other layout as a child, allowing complex storage organizations to be expressed as simple tree structures.
+
+### Replicating Parquet row groups
+
+To replicate the organizational structure of Parquet, for example, you would compose layouts as follows:
+
+```text
+ChunkedLayout(ChunkBy::RowCount(100_000))    ← row groups of 100k rows
+  └── StructLayout                            ← split by column (column chunks)
+        └── ChunkedLayout(ChunkBy::CompressedSize(64k))  ← pages by compressed size
+              └── FlatLayout                  ← individual serialized array
+```
+
+This gives you the same row-group/column-chunk/page hierarchy as Parquet, configurable entirely through layout composition — no file format changes required.
+
+### Default Vortex file layout
+
+The default layout strategy used when writing `.vortex` files is tuned for analytical query performance:
+
+```text
+StructLayout                                  ← column pruning at the top level
+  └── ZonedLayout (every 8k rows)             ← zone statistics for row pruning
+        └── ChunkedLayout (2 MB uncompressed) ← column chunks
+              └── FlatLayout                  ← compressed array segments
+```
+
+The 8k-row zones balance pruning granularity against metadata overhead. The 2 MB chunk size is chosen to keep I/O efficient while allowing parallel decompression.
+
+## Layout strategies
+
+A `LayoutStrategy` defines how to construct a layout tree from a stream of incoming Vortex arrays. Strategies are composable: one strategy may add row-group chunking, another may add zone statistics, another may apply compression. They are chained together to produce the final layout tree.
+
+For segment sinks that are locality-aware — such as a `.vortex` file — layout strategies can use _sequence IDs_, which are logical clocks that allow parallel write and compression tasks to produce output in a fully deterministic order regardless of when each task completes.
+
+## Random access and pruning
+
+Because the layout tree records metadata (including statistics) separately from the data segments, a reader can make pruning decisions without fetching any data:
+
+1. **Column pruning** — A `StructLayout` reader fetches only the child layouts corresponding to the projected columns. Unreferenced columns are never read.
+2. **Zone pruning** — A `ZonedLayout` reader checks the stored statistics for each zone against the filter predicate. Zones that cannot contain matching rows are skipped entirely.
+3. **Lazy segment loading** — Segments are only fetched when the reader actually needs to materialize an array. A query that is fully pruned by statistics never touches the data segments.
+
+<Tip>
+  Zone pruning is most effective on sorted or clustered columns, where the min/max values in a zone are tightly bounded. The Vortex compressor can optionally sort columns before writing to improve zone pruning effectiveness.
+</Tip>
+
+## Storage backends
+
+Because the segment source is an abstraction, the same layout tree can be read from any storage medium without changing the layout or the query engine integration:
+
+- Local disk (via `mmap` or buffered reads)
+- Object stores (S3, GCS, Azure Blob)
+- Remote caches (Redis, Memcached)
+- Database block storage (Postgres)
+- In-memory buffers (for testing or streaming)
+
+This abstraction is what makes Vortex's scan architecture storage-agnostic by design.

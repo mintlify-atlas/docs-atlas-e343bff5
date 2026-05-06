@@ -1,0 +1,218 @@
+---
+title: "DType Serialization Format"
+description: "Vortex DTypes use FlatBuffers for .vortex files and IPC, and Protocol Buffers for expressions. Discriminants are fixed for backward compatibility."
+---
+
+Vortex uses a unified logical type system called `DType` throughout the library. `DType` values are serialized in two different wire formats depending on context: **FlatBuffers** for the `.vortex` file format and IPC messages, and **Protocol Buffers** for expressions, statistics, and other proto-based subsystems.
+
+## Type system overview
+
+The `DType` union covers eleven variants:
+
+| Variant | FlatBuffers discriminant | Description |
+|---|---|---|
+| `Null` | `1` | The null type (no values) |
+| `Bool` | `2` | Boolean values |
+| `Primitive` | `3` | Fixed-width numeric types (see `PType`) |
+| `Decimal` | `4` | Decimal number with precision and scale |
+| `Utf8` | `5` | UTF-8 encoded strings |
+| `Binary` | `6` | Arbitrary byte sequences |
+| `Struct_` | `7` | Named, heterogeneous fields |
+| `List` | `8` | Variable-length sequences of a single element type |
+| `Extension` | `9` | User-defined types with a storage type and opaque metadata |
+| `FixedSizeList` | `10` | Fixed-length sequences of a single element type |
+| `Variant` | `11` | Semi-structured / schemaless nested values |
+
+<Info>
+  `FixedSizeList` is assigned discriminant `10` (after `Extension` at `9`) to preserve backwards compatibility with files written before `FixedSizeList` was added.
+</Info>
+
+Most non-null types carry a `nullable: bool` field indicating whether the array may contain null values.
+
+## FlatBuffers definition
+
+FlatBuffers serialization is used in `.vortex` files (the `dtype` segment) and in IPC `DTypeMessage` bodies.
+
+```text
+// vortex-flatbuffers/flatbuffers/vortex-dtype/dtype.fbs
+
+enum PType: uint8 {
+    U8, U16, U32, U64,
+    I8, I16, I32, I64,
+    F16, F32, F64,
+}
+
+table Null {}
+
+table Bool {
+    nullable: bool;
+}
+
+table Primitive {
+    ptype:    PType;
+    nullable: bool;
+}
+
+table Decimal {
+    precision: uint8;
+    scale:     int8;
+    nullable:  bool;
+}
+
+table Utf8   { nullable: bool; }
+table Binary { nullable: bool; }
+
+table Struct_ {
+    names:    [string];
+    dtypes:   [DType];
+    nullable: bool;
+}
+
+table List {
+    element_type: DType;
+    nullable:     bool;
+}
+
+table FixedSizeList {
+    element_type: DType;
+    size:         uint32;
+    nullable:     bool;
+}
+
+table Extension {
+    id:           string;
+    storage_dtype: DType;
+    metadata:     [ubyte];
+}
+
+table Variant { nullable: bool; }
+
+union Type {
+    Null = 1,
+    Bool = 2,
+    Primitive = 3,
+    Decimal = 4,
+    Utf8 = 5,
+    Binary = 6,
+    Struct_ = 7,
+    List = 8,
+    Extension = 9,
+    FixedSizeList = 10,
+    Variant = 11,
+}
+
+table DType {
+    type: Type;
+}
+
+root_type DType;
+```
+
+### Primitive numeric types
+
+The `PType` enum covers all fixed-width numeric types supported by Vortex:
+
+| `PType` | Rust equivalent | Width |
+|---|---|---|
+| `U8` | `u8` | 8-bit unsigned integer |
+| `U16` | `u16` | 16-bit unsigned integer |
+| `U32` | `u32` | 32-bit unsigned integer |
+| `U64` | `u64` | 64-bit unsigned integer |
+| `I8` | `i8` | 8-bit signed integer |
+| `I16` | `i16` | 16-bit signed integer |
+| `I32` | `i32` | 32-bit signed integer |
+| `I64` | `i64` | 64-bit signed integer |
+| `F16` | `f16` | 16-bit IEEE float |
+| `F32` | `f32` | 32-bit IEEE float |
+| `F64` | `f64` | 64-bit IEEE float |
+
+### Extension type serialization
+
+The `Extension` type allows user-defined types to be stored in Vortex files. An extension type carries:
+
+- **`id`** — a globally unique string identifier for the extension type, resolved against the Vortex registry at read-time.
+- **`storage_dtype`** — the underlying `DType` used to physically store the values.
+- **`metadata`** — opaque byte metadata interpreted by the extension type's implementation.
+
+Extension types do not carry a `nullable` field directly; nullability is inherited from the `storage_dtype`.
+
+### Struct field paths
+
+The `dtype.proto` file also defines `Field` and `FieldPath` messages for addressing fields within a struct schema, used in expression serialization:
+
+```text
+// vortex-proto/proto/dtype.proto
+
+message Field {
+    oneof field_type {
+        string name = 1;
+    }
+}
+
+message FieldPath {
+    repeated Field path = 1;
+}
+```
+
+## Protocol Buffers definition
+
+Protocol Buffers serialization is used in expressions (see [Scalar Serialization Format](/spec/scalar-format)) and in other proto-based subsystems. The proto schema mirrors the FlatBuffers schema with minor differences in field numbering and nullability representation.
+
+```protobuf
+// vortex-proto/proto/dtype.proto
+
+syntax = "proto3";
+package vortex.dtype;
+
+enum PType {
+  U8 = 0; U16 = 1; U32 = 2; U64 = 3;
+  I8 = 4; I16 = 5; I32 = 6; I64 = 7;
+  F16 = 8; F32 = 9; F64 = 10;
+}
+
+message Null {}
+message Bool     { bool nullable = 1; }
+message Primitive { PType type = 1; bool nullable = 2; }
+message Decimal  { uint32 precision = 1; int32 scale = 2; bool nullable = 3; }
+message Utf8     { bool nullable = 1; }
+message Binary   { bool nullable = 1; }
+
+message Struct {
+  repeated string names  = 1;
+  repeated DType  dtypes = 2;
+  bool nullable          = 3;
+}
+
+message List         { DType element_type = 1; bool nullable = 2; }
+message FixedSizeList { DType element_type = 1; uint32 size = 2; bool nullable = 3; }
+
+message Extension {
+  string id           = 1;
+  DType  storage_dtype = 2;
+  optional bytes metadata = 3;
+}
+
+message Variant { bool nullable = 1; }
+
+message DType {
+  oneof dtype_type {
+    Null          null            = 1;
+    Bool          bool            = 2;
+    Primitive     primitive       = 3;
+    Decimal       decimal         = 4;
+    Utf8          utf8            = 5;
+    Binary        binary          = 6;
+    Struct        struct          = 7;
+    List          list            = 8;
+    Extension     extension       = 9;
+    FixedSizeList fixed_size_list = 10;
+    Variant       variant         = 11;
+  }
+}
+```
+
+The `oneof` field numbers in the proto definition match the FlatBuffers union discriminant values, making the type system consistent across both serialization formats.
+
+## Versioning
+
+The FlatBuffers union discriminant values and proto `oneof` field numbers are fixed and must not be changed. New `DType` variants are appended at the end of the union with the next available discriminant (currently `12`). Existing fields within each variant table may have new optional fields appended, but existing fields must not be removed or renumbered.

@@ -1,0 +1,72 @@
+---
+title: "Polars Integration"
+description: "Use VortexFile.to_polars() to get a LazyFrame with column pruning and predicate pushdown from .vortex files via the vortex-data Python package."
+---
+
+Vortex integrates with Polars through the `vortex-data` Python package. The `VortexFile.to_polars()` method returns a `polars.LazyFrame` with column pruning and predicate pushdown, so Polars only reads and decompresses the data it needs.
+
+<Warning>
+  The Polars integration is experimental. Polars' expression API is unstable and not all pushdown expressions are currently supported. If you run into issues or need more features, please [file an issue](https://github.com/vortex-data/vortex/issues).
+</Warning>
+
+## Installation
+
+```bash
+pip install vortex-data
+```
+
+## Reading a Vortex file into Polars
+
+Open a `.vortex` file and call `to_polars()` to get a `LazyFrame`. Polars operations like `select` and `head` are pushed down into the Vortex scan before collection:
+
+```python
+import vortex as vx
+import pyarrow.parquet as pq
+
+# Write a Parquet file as Vortex
+vx.io.write(pq.read_table("example.parquet"), 'example.vortex')
+
+# Open and query with Polars
+lf = vx.open('example.vortex').to_polars()
+lf = lf.select('tip_amount', 'fare_amount')
+lf = lf.head(3)
+lf.collect()
+# shape: (3, 2)
+# ┌────────────┬─────────────┐
+# │ tip_amount ┆ fare_amount │
+# │ ---        ┆ ---         │
+# │ f64        ┆ f64         │
+# ╞════════════╪═════════════╡
+# │ 0.0        ┆ 61.8        │
+# │ 5.1        ┆ 20.5        │
+# │ 16.54      ┆ 70.0        │
+# └────────────┴─────────────┘
+```
+
+## Pushdown support
+
+`to_polars()` returns a lazy frame, meaning Polars can push column selections and filter predicates into the Vortex scan before data is read from disk. Only the requested columns are decompressed.
+
+<Note>
+  Predicate pushdown support depends on Polars' expression API, which is unstable. Some filter expressions may not be pushed down and will fall back to in-memory evaluation after the scan.
+</Note>
+
+## Arrow interop
+
+Vortex arrays use Apache Arrow as the interchange format between Vortex and Polars. You can also work with Vortex arrays directly and convert them to Arrow for use with Polars:
+
+```python
+import vortex as vx
+import polars as pl
+
+# Create a Vortex array
+arr = vx.array([
+    {'name': 'Alice', 'age': 30},
+    {'name': 'Bob', 'age': 25},
+    {'name': 'Carol', 'age': 35},
+])
+
+# Convert to Arrow table, then to Polars DataFrame
+arrow_table = arr.to_arrow_table()
+df = pl.from_arrow(arrow_table)
+```

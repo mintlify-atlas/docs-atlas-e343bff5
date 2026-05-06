@@ -1,0 +1,171 @@
+---
+title: "Async I/O and Runtime"
+description: "Vortex uses async Rust for file I/O with a flexible runtime abstraction supporting Tokio and smol for reading from local and cloud storage."
+---
+
+Vortex performs all file I/O asynchronously. Rather than committing to a single async runtime, it defines its own runtime abstraction in `vortex-io`. This lets different integrations — DataFusion with Tokio, DuckDB with its thread-per-core model — use the threading strategy that best fits their host engine.
+
+## Runtime Abstraction
+
+The central type is `Handle`: a cloneable weak reference to an active runtime. All async work in Vortex — I/O, compute, background tasks — is spawned through a handle. The handle is stored in the session via `RuntimeSession` and threaded through the API alongside other session state.
+
+Internally, a `Handle` wraps a `Weak<dyn Executor>`. The `Executor` trait defines three spawn methods:
+
+```rust
+pub trait Executor: Send + Sync {
+    /// Spawn an async future onto the runtime.
+    fn spawn(&self, fut: BoxFuture<'static, ()>) -> AbortHandleRef;
+
+    /// Spawn a CPU-bound closure.
+    fn spawn_cpu(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef;
+
+    /// Spawn a blocking I/O closure onto a dedicated blocking pool.
+    fn spawn_blocking_io(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef;
+}
+```
+
+All spawned tasks must be `Send + 'static`. `Handle::find()` will auto-detect a running Tokio context if the `tokio` feature flag is enabled — useful when Vortex is initialized inside an existing async application.
+
+Callers spawn work through the `Handle` methods:
+
+```rust
+// Spawn an async future
+let task = handle.spawn(async { /* ... */ });
+
+// Spawn CPU-bound work (e.g. decompression)
+let task = handle.spawn_cpu(|| decompress_chunk(buf));
+
+// Spawn a blocking I/O call (e.g. synchronous file read)
+let task = handle.spawn_blocking(|| std::fs::read(path));
+```
+
+`Task<T>` is a `Future` that resolves to the task's output. Dropping a `Task` cancels it where possible. Call `.detach()` to let it run in the background.
+
+<Warning>
+A `Handle` is a **weak reference** to the runtime. If the runtime is dropped before all outstanding handles are used, spawning a new task will panic. Ensure the runtime outlives all handles derived from it.
+</Warning>
+
+## Tokio Integration
+
+The `TokioRuntime` adapter wraps a `tokio::runtime::Handle` and delegates all spawning to Tokio's thread pool. It is the right choice for applications that already run inside a Tokio context, such as DataFusion or Axum servers.
+
+```rust
+// Configure the session to use the current Tokio runtime
+let session = VortexSession::default().with_tokio();
+```
+
+When `with_tokio()` is called, the adapter captures the current Tokio runtime handle. If no Tokio context is active at that point, it panics. For applications that do not already use Tokio, the `CurrentThreadRuntime` described below is preferred.
+
+## CurrentThreadRuntime (smol)
+
+The `CurrentThreadRuntime` (CRT) is built on [smol](https://github.com/smol-rs/smol) and provides a more flexible threading model. Unlike Tokio, the CRT does not spawn background threads by default — it relies on the calling thread to drive the executor by calling `block_on`.
+
+This design fits thread-per-core engines like DuckDB: when DuckDB calls into a Vortex scan on one of its worker threads, that thread blocks on a future and drives the entire smol executor for the duration of the call. No separate I/O thread pool is required, and the engine retains full control over its threading model.
+
+### Worker Pool
+
+For workloads that need background I/O progress while the calling thread is busy, the CRT can be paired with a `CurrentThreadWorkerPool`:
+
+```rust
+let runtime = CurrentThreadRuntime::new();
+let pool = runtime.new_pool();
+
+// Scale up to match available CPU cores
+pool.set_workers_to_available_parallelism();
+
+// Or set an explicit thread count
+pool.set_workers(4);
+```
+
+Each worker is a standard OS thread running `block_on(executor.run(...))` in a loop. Workers can be scaled up and down dynamically at runtime. When the count is reduced, excess workers are signalled to shut down gracefully.
+
+<Note>
+The CRT has a known pitfall: a thread busy evaluating a CPU-bound kernel is not polling the executor, which can stall in-flight I/O requests. Spawning a worker pool mitigates this, but adds threads and coordination overhead. This is an active area of design work.
+</Note>
+
+## VortexReadAt: Unified I/O Interface
+
+The `VortexReadAt` trait is the unified interface for positional reads across all storage backends:
+
+```rust
+pub trait VortexReadAt: Send + Sync + 'static {
+    /// Maximum number of concurrent in-flight reads.
+    fn concurrency(&self) -> usize;
+
+    /// Optional coalescing configuration for merging nearby reads.
+    fn coalesce_config(&self) -> Option<CoalesceConfig>;
+
+    /// Asynchronously return the total size of the source in bytes.
+    fn size(&self) -> BoxFuture<'static, VortexResult<u64>>;
+
+    /// Asynchronously read `length` bytes at `offset` with the given alignment.
+    fn read_at(
+        &self,
+        offset: u64,
+        length: usize,
+        alignment: Alignment,
+    ) -> BoxFuture<'static, VortexResult<BufferHandle>>;
+}
+```
+
+Implementations are provided for:
+
+- **`ByteBuffer`** — in-memory reads, no I/O.
+- **`std_file` / `FileReadAdapter`** — local disk reads dispatched via `spawn_blocking` to avoid blocking the async executor.
+- **`ObjectStoreSource`** — object storage reads via the [`object_store`](https://crates.io/crates/object_store) crate (S3, GCS, Azure Blob, and more). Natively async, wrapped with `async_compat` for runtime compatibility.
+
+## Read Coalescing
+
+When reading columnar segments, many small reads target nearby offsets. The I/O system merges them into fewer, larger reads using `CoalesceConfig`:
+
+```rust
+pub struct CoalesceConfig {
+    /// Max gap between two reads that will be merged.
+    pub distance: u64,
+    /// Max span of a single coalesced read.
+    pub max_size: u64,
+}
+```
+
+Default configurations are tuned per backend:
+
+| Backend | Concurrency | Coalesce Distance | Coalesce Max Size |
+|---|---|---|---|
+| In-memory | 16 | 8 KB | 8 KB |
+| Local file | 32 | 1 MB | 4 MB |
+| Object store | 192 | 1 MB | 16 MB |
+
+Local files use relatively small coalescing windows because NVMe read latency is low. Object stores use large windows because each HTTP round-trip has significant overhead — merging many small reads into a single 16 MB request is dramatically more efficient.
+
+## Object Storage Support
+
+The `object_store` feature gate enables the `ObjectStoreSource` adapter, which wraps any [`object_store::ObjectStore`](https://docs.rs/object_store) implementation:
+
+```rust
+use object_store::aws::AmazonS3Builder;
+use vortex_io::object_store::ObjectStoreSource;
+
+let store = AmazonS3Builder::new()
+    .with_bucket_name("my-bucket")
+    .build()?;
+
+let source = ObjectStoreSource::new(Arc::new(store), path);
+let session = VortexSession::default().with_tokio();
+session.open_options().open(source).await?;
+```
+
+Object store reads are natively async and automatically use the 192-concurrency, 1 MB/16 MB coalescing defaults.
+
+## WASM Support
+
+On `wasm32-unknown-unknown` targets, the standard file and thread-blocking APIs are unavailable. The `wasm` runtime module provides a browser-compatible executor that drives futures using JavaScript's microtask queue. The `std_file` module is excluded on WASM targets via `#[cfg(not(target_arch = "wasm32"))]`.
+
+## Instrumented Reads
+
+`InstrumentedReadAt<T>` wraps any `VortexReadAt` implementation with metrics collection. It records read sizes (as a histogram), total bytes read (as a counter), and read durations (as a timer), and logs a summary when the wrapper is dropped:
+
+```rust
+let instrumented = InstrumentedReadAt::new(source, &metrics_registry);
+```
+
+The metrics are exposed via the `vortex-metrics` crate and can be wired into any compatible metrics backend.

@@ -1,0 +1,103 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Vortex",
+  "projectDescription": "An extensible, state-of-the-art framework for columnar compression and the fastest FOSS columnar file format, with zero-copy Apache Arrow integration and native query engine connectors.",
+  "theme": "aspen",
+  "primaryColor": "#ffffff",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart/python",
+              "quickstart/rust",
+              "quickstart/java"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/dtypes",
+              "concepts/arrays",
+              "concepts/encodings",
+              "concepts/layouts",
+              "concepts/scanning"
+            ]
+          },
+          {
+            "group": "Query Engine Integrations",
+            "pages": [
+              "integrations/datafusion",
+              "integrations/duckdb",
+              "integrations/spark",
+              "integrations/polars",
+              "integrations/ray"
+            ]
+          },
+          {
+            "group": "Extending Vortex",
+            "pages": [
+              "extending/custom-encodings",
+              "extending/custom-layouts",
+              "extending/custom-dtypes",
+              "extending/compute-functions"
+            ]
+          },
+          {
+            "group": "Internals & Architecture",
+            "pages": [
+              "internals/architecture",
+              "internals/session",
+              "internals/async-runtime",
+              "internals/ffi-and-embedding"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "File Format Spec",
+        "groups": [
+          {
+            "group": "Specification",
+            "pages": [
+              "spec/file-format",
+              "spec/ipc-format",
+              "spec/dtype-format",
+              "spec/scalar-format"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "100x faster random access reads vs Apache Parquet",
+    "Zero-copy Apache Arrow integration",
+    "Pluggable encoding system (FastLanes, FSST, ALP, BtrBlocks, RLE, dictionary, etc.)",
+    "Stable columnar file format (.vortex) with O(1) column access via FlatBuffer metadata",
+    "Native query engine integrations: DataFusion, DuckDB, Spark, Trino, Polars, Ray",
+    "Multi-language support: Rust crate, Python (vortex-data on PyPI), Java/JVM with Spark connector",
+    "Cascading compression with compute-on-compressed data (no decompress for many operations)",
+    "Scan API with filter, projection, and limit pushdown over object storage"
+  ],
+  "publicApiSurface": [
+    "vortex::array (ArrayRef, PrimitiveArray, StructArray, ChunkedArray, IntoArray)",
+    "vortex::dtype (DType, Nullability)",
+    "vortex::file (WriteOptionsSessionExt, OpenOptionsSessionExt, WriteStrategyBuilder)",
+    "vortex::session (VortexSession, VortexSessionDefault)",
+    "vortex::scan (ScanBuilder, with_filter, with_projection)",
+    "vortex::compressor (BtrBlocksCompressor, BtrBlocksCompressorBuilder)",
+    "vortex::encodings (alp, fastlanes, fsst, pco, runend, sparse, zigzag, zstd)",
+    "vortex::ipc (IPC stream read/write)",
+    "vortex::expr (gt, lit, root, select)",
+    "Python: vortex.file (open, write), vortex.dataset, vortex.scan, vortex.expr, vortex.arrays",
+    "vx CLI (vortex-tui): vx browse <file>",
+    "vx-bench CLI: vx-bench run, vx-bench compare"
+  ]
+}

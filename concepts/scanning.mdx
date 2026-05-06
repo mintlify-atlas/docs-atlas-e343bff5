@@ -1,0 +1,114 @@
+---
+title: "Scan API: Efficient Pushdown Queries"
+description: "Vortex's Scan API enables filter, projection, and limit pushdown over compressed data — reading only what you need from storage."
+---
+
+The Vortex Scan API defines a standard interface between data storage backends and query engines. It solves the N×M integration problem: instead of requiring every storage format to speak every query engine's internal language, both sides implement against a single shared interface.
+
+```text
+Storage                                  Query Engines
+───────                                  ─────────────
+
+Vortex Files   ──► ┌──────────────┐ ──►  DuckDB
+Parquet Files  ──► │   Scan API   │ ──►  DataFusion
+Iceberg Tables ──► └──────────────┘ ──►  Spark
+```
+
+<Note>
+  The Scan API is under active development. The core `Source` trait and scan pipeline are functional, but the full API surface is still being defined.
+</Note>
+
+## Why the Scan API matters
+
+Traditional data integrations require each storage backend to decompress its data into Apache Arrow arrays before handing them to a query engine. The engine then recompresses or re-encodes the data in its own internal format. This round-trip is wasteful: CPU time is spent decompressing data that will never be examined, and then re-compressing data the engine already understands.
+
+The Vortex Scan API avoids this by allowing data to flow between storage and query engines in its **native compressed encoding**. For example, the DuckDB integration can receive FSST-encoded string arrays directly from a Vortex file and pass them into DuckDB's own internal FSST representation — with no decompression step at all.
+
+## Sources and sinks
+
+### Source
+
+A `Source` represents any scannable tabular data. It accepts a scan request describing the filter, projection, and limit to push down, and returns a stream of independently executable _splits_ that can be run concurrently to produce result arrays.
+
+### Sink
+
+An equivalent `Sink` interface exists for the write path. A sink accepts an array stream and writes it to the underlying storage. Together, `Source` and `Sink` give query engines a symmetric interface for both reading and writing any storage backend.
+
+## Splits
+
+A source divides its data into **splits** — independent units of work that can be executed in parallel. A split typically corresponds to a range of rows in a layout, such as a chunk or a row-group partition.
+
+Each split carries:
+- **Size and row count estimates** — used by the query engine for scheduling and cost-based decisions
+- **Serialized state** — splits can be serialized and sent to remote workers for distributed execution
+
+### Remote sources
+
+A source may front remote storage rather than local files. In that case, the split's execution issues a remote call and receives the result over the network. The Vortex IPC format can be used as the wire protocol for these calls, allowing compressed arrays to be transferred without decompression. The data stays in its compressed encoding end-to-end — from remote storage through the network and into the query engine.
+
+## Filter pushdown
+
+Filter expressions are decomposed into individual conjuncts (AND-separated terms) and evaluated independently. The scan dynamically reorders conjuncts based on observed selectivity: as the scan progresses, it learns which predicates eliminate the most rows earliest and prioritizes those.
+
+Filter evaluation happens in two stages:
+
+<Steps>
+  <Step title="Zone pruning">
+    Before reading any data, the scan checks statistics stored in a `ZonedLayout` auxiliary zone map against the filter predicate. These are _falsification checks_: if a zone's min/max values prove that no row in the zone can match the predicate, the entire zone is skipped. This happens entirely in metadata — no data segments are fetched.
+  </Step>
+  <Step title="Row mask computation">
+    For zones that survive pruning, only the columns referenced by the filter are materialized. A boolean row mask is computed over those columns. Only rows where the mask is `true` proceed to projection and output.
+  </Step>
+</Steps>
+
+## Projection pushdown
+
+A projection expression describes the output schema of the scan. The scan analyzes both the filter and projection expressions to compute two field masks:
+
+1. **Filter mask** — columns needed to evaluate the filter
+2. **Output mask** — columns needed for the final result
+
+Only the union of these two masks is read from storage. Columns needed exclusively for filtering are discarded after the row mask is computed, so they never appear in the output stream. This minimizes data movement throughout the pipeline.
+
+## Integration with query engines
+
+Query engines integrate with the Scan API by translating their internal plan representations into scan requests and consuming the resulting array stream. Integrations exist for:
+
+<CardGroup cols={2}>
+  <Card title="DataFusion" icon="database" href="/integrations/datafusion">
+    Apache DataFusion integration via the TableProvider trait.
+  </Card>
+  <Card title="DuckDB" icon="database" href="/integrations/duckdb">
+    DuckDB integration with native compressed array exchange.
+  </Card>
+  <Card title="Spark" icon="bolt" href="/integrations/spark">
+    Apache Spark integration for distributed Vortex scans.
+  </Card>
+  <Card title="Polars" icon="chart-bar" href="/integrations/polars">
+    Polars integration via the scan source interface.
+  </Card>
+</CardGroup>
+
+Each integration translates the engine's native filter and projection representations into Vortex expressions, then consumes the scan output in the engine's preferred format — either as Arrow arrays or, where supported, as native Vortex compressed arrays.
+
+## Expressions
+
+Scan filters and projections are described using Vortex expressions — abstract scalar functions that operate over arrays. Expressions are strictly typed: the input dtypes must match the function's expected signature exactly, and type coercion is the caller's responsibility.
+
+Applying an expression to an array does not immediately compute a result. Instead, Vortex constructs a deferred `ScalarFnArray` that represents the pending computation. This allows the scan engine to compose multiple expressions, fuse them, and dispatch them through encoding-specific kernels where available — all before any data is read from storage.
+
+```text
+Filter expression:  status = 'active' AND age > 30
+
+Decomposed conjuncts:
+  1. status = 'active'   ← checked against zone min/max first
+  2. age > 30            ← reordered by observed selectivity
+
+Projection: { user_id, name }
+  → reads: status, age (filter), user_id, name (output)
+  → discards: status, age after mask is computed
+```
+
+<Tip>
+  For best scan performance, write data so that filter columns are sorted or clustered. This maximizes zone pruning effectiveness and reduces the number of data segments that need to be fetched.
+</Tip>

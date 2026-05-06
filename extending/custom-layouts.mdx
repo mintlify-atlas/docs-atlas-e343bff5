@@ -1,0 +1,324 @@
+---
+title: "Writing a Custom Layout"
+description: "Add a custom Vortex layout by implementing the layout VTable and LayoutReader traits — controlling chunking, pruning, filtering, and projection on disk."
+---
+
+Layouts describe how arrays are organized on disk. Where encodings govern in-memory physical representation, layouts govern the on-disk tree structure — how data is chunked, nested, and read back. Vortex ships with layouts such as `FlatLayout` (a single serialized array segment), `ChunkedLayout` (multiple row-based chunks), and `StructLayout` (one child per field). You can add your own.
+
+<Warning>
+  This part of the Vortex documentation is still being written. The content below is based on the current source in `vortex-layout/src/`. For guidance not yet covered, join the [Vortex Slack](https://vortex.dev/slack) or open a [GitHub Discussion](https://github.com/vortex-data/vortex/discussions).
+</Warning>
+
+## What a layout is
+
+A layout is a node in a tree that describes a region of a Vortex file. Each node knows its:
+
+- **encoding ID** — a stable namespaced string like `"vortex.flat"`
+- **dtype** — the logical type of the data it holds
+- **row count** — number of logical rows
+- **segment IDs** — references to raw byte segments on disk
+- **children** — nested layout nodes (chunks, fields, auxiliary data)
+
+Reading a layout creates a `LayoutReader`, which handles I/O requests, pruning evaluation, filter evaluation, and projection evaluation for a range of rows.
+
+## Key traits
+
+### `VTable` (layout)
+
+The layout `VTable` in `vortex-layout` is analogous to the array `VTable` in `vortex-array`. Implementing it for a struct `MyLayout` wires up the layout tree operations.
+
+```rust
+pub trait VTable: 'static + Sized + Send + Sync + Debug {
+    type Layout: 'static + Send + Sync + Clone + Debug + Deref<Target = dyn Layout> + IntoLayout;
+    type Encoding: 'static + Send + Sync + Deref<Target = dyn LayoutEncoding>;
+    type Metadata: SerializeMetadata + DeserializeMetadata + Debug;
+
+    fn id(encoding: &Self::Encoding) -> LayoutId;
+    fn encoding(layout: &Self::Layout) -> LayoutEncodingRef;
+    fn row_count(layout: &Self::Layout) -> u64;
+    fn dtype(layout: &Self::Layout) -> &DType;
+    fn metadata(layout: &Self::Layout) -> Self::Metadata;
+    fn segment_ids(layout: &Self::Layout) -> Vec<SegmentId>;
+    fn nchildren(layout: &Self::Layout) -> usize;
+    fn child(layout: &Self::Layout, idx: usize) -> VortexResult<LayoutRef>;
+    fn child_type(layout: &Self::Layout, idx: usize) -> LayoutChildType;
+
+    /// Create a LayoutReader for this layout.
+    fn new_reader(
+        layout: &Self::Layout,
+        name: Arc<str>,
+        segment_source: Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<LayoutReaderRef>;
+
+    /// Reconstruct a layout from serialized components.
+    fn build(
+        encoding: &Self::Encoding,
+        dtype: &DType,
+        row_count: u64,
+        metadata: &<Self::Metadata as DeserializeMetadata>::Output,
+        segment_ids: Vec<SegmentId>,
+        children: &dyn LayoutChildren,
+        ctx: &ReadContext,
+    ) -> VortexResult<Self::Layout>;
+}
+```
+
+The `vtable!` macro in `vortex-layout` generates boilerplate `Deref`, `IntoLayout`, and `AsRef` implementations for your layout and encoding types:
+
+```rust
+use vortex_layout::vtable;
+
+vtable!(MyLayout);
+// Generates MyLayout (vtable struct), MyLayoutLayout, MyLayoutEncoding
+```
+
+### `LayoutChildType`
+
+When implementing `child_type`, return a variant of `LayoutChildType` that describes the relationship of the child to its parent:
+
+```rust
+pub enum LayoutChildType {
+    /// A child that transparently wraps the same schema and row offset.
+    Transparent(Arc<str>),
+    /// A child that provides auxiliary data (e.g. zone maps, dictionary values).
+    Auxiliary(Arc<str>),
+    /// A child that is a row-based chunk with a given chunk index and row offset.
+    Chunk((usize, u64)),
+    /// A child that represents a single struct field.
+    Field(FieldName),
+}
+```
+
+### `LayoutReader`
+
+`LayoutReader` is the runtime object created by `VTable::new_reader`. It handles all I/O for a layout node. The trait is defined in `vortex-layout/src/reader.rs`:
+
+```rust
+pub trait LayoutReader: 'static + Send + Sync {
+    fn name(&self) -> &Arc<str>;
+    fn as_any(&self) -> &dyn Any;
+    fn dtype(&self) -> &DType;
+    fn row_count(&self) -> u64;
+
+    /// Register the row splits produced by this layout into the given BTreeSet.
+    fn register_splits(
+        &self,
+        field_mask: &[FieldMask],
+        row_range: &Range<u64>,
+        splits: &mut BTreeSet<u64>,
+    ) -> VortexResult<()>;
+
+    /// Return a future mask where false entries are proven to not match the expression.
+    /// Does not need to intersect with the input mask.
+    fn pruning_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        mask: Mask,
+    ) -> VortexResult<MaskFuture>;
+
+    /// Refine the mask by evaluating the expression. Must intersect with the input mask.
+    fn filter_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        mask: MaskFuture,
+    ) -> VortexResult<MaskFuture>;
+
+    /// Evaluate an expression and return an array. Length must equal the true count of the mask.
+    fn projection_evaluation(
+        &self,
+        row_range: &Range<u64>,
+        expr: &Expression,
+        mask: MaskFuture,
+    ) -> VortexResult<ArrayFuture>;
+}
+```
+
+<Tip>
+  Defer awaiting the input `MaskFuture` as long as possible — ideally after all I/O has been issued. This allows other conjuncts to refine the mask before it is materialized, improving parallel I/O and selectivity.
+</Tip>
+
+## Step-by-step: writing a custom layout
+
+<Steps>
+  <Step title="Define your layout and encoding types">
+    Use the `vtable!` macro to generate the scaffolding, then define your concrete layout struct:
+
+    ```rust
+    use vortex_layout::vtable;
+
+    vtable!(MyLayout);
+
+    #[derive(Debug)]
+    pub struct MyLayoutEncoding;
+
+    #[derive(Clone, Debug)]
+    pub struct MyLayoutLayout {
+        row_count: u64,
+        dtype: DType,
+        segment_id: SegmentId,
+    }
+    ```
+  </Step>
+
+  <Step title="Implement the VTable trait">
+    Wire up identity, metadata, children, and reader construction:
+
+    ```rust
+    use vortex_layout::{VTable, LayoutChildType, LayoutId, LayoutEncodingRef, LayoutReaderRef};
+    use std::sync::Arc;
+
+    impl VTable for MyLayout {
+        type Layout = MyLayoutLayout;
+        type Encoding = MyLayoutEncoding;
+        type Metadata = ProstMetadata<MyLayoutMetadata>; // define with prost::Message
+
+        fn id(_encoding: &Self::Encoding) -> LayoutId {
+            LayoutId::new("myorg.mylayout")
+        }
+
+        fn encoding(_layout: &Self::Layout) -> LayoutEncodingRef {
+            LayoutEncodingRef::new_ref(MyLayoutEncoding.as_ref())
+        }
+
+        fn row_count(layout: &Self::Layout) -> u64 { layout.row_count }
+        fn dtype(layout: &Self::Layout) -> &DType { &layout.dtype }
+
+        fn metadata(layout: &Self::Layout) -> Self::Metadata {
+            ProstMetadata(MyLayoutMetadata { /* fill fields */ })
+        }
+
+        fn segment_ids(layout: &Self::Layout) -> Vec<SegmentId> {
+            vec![layout.segment_id]
+        }
+
+        fn nchildren(_layout: &Self::Layout) -> usize { 0 }
+
+        fn child(_layout: &Self::Layout, _idx: usize) -> VortexResult<LayoutRef> {
+            vortex_bail!("MyLayout has no children")
+        }
+
+        fn child_type(_layout: &Self::Layout, _idx: usize) -> LayoutChildType {
+            vortex_panic!("MyLayout has no children")
+        }
+
+        fn new_reader(
+            layout: &Self::Layout,
+            name: Arc<str>,
+            segment_source: Arc<dyn SegmentSource>,
+            session: &VortexSession,
+        ) -> VortexResult<LayoutReaderRef> {
+            Ok(Arc::new(MyLayoutReader::new(
+                layout.clone(), name, segment_source, session.clone(),
+            )))
+        }
+
+        fn build(
+            _encoding: &Self::Encoding,
+            dtype: &DType,
+            row_count: u64,
+            metadata: &<Self::Metadata as DeserializeMetadata>::Output,
+            segment_ids: Vec<SegmentId>,
+            _children: &dyn LayoutChildren,
+            _ctx: &ReadContext,
+        ) -> VortexResult<Self::Layout> {
+            Ok(MyLayoutLayout {
+                row_count,
+                dtype: dtype.clone(),
+                segment_id: segment_ids[0],
+            })
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Implement LayoutReader">
+    Create a reader struct that holds the layout and any cached state. Implement all four methods of `LayoutReader`:
+
+    ```rust
+    use vortex_layout::LayoutReader;
+
+    pub struct MyLayoutReader {
+        layout: MyLayoutLayout,
+        name: Arc<str>,
+        segment_source: Arc<dyn SegmentSource>,
+        session: VortexSession,
+    }
+
+    impl LayoutReader for MyLayoutReader {
+        fn name(&self) -> &Arc<str> { &self.name }
+        fn as_any(&self) -> &dyn Any { self }
+        fn dtype(&self) -> &DType { &self.layout.dtype }
+        fn row_count(&self) -> u64 { self.layout.row_count }
+
+        fn register_splits(
+            &self,
+            _field_mask: &[FieldMask],
+            row_range: &Range<u64>,
+            splits: &mut BTreeSet<u64>,
+        ) -> VortexResult<()> {
+            splits.insert(row_range.start + self.layout.row_count);
+            Ok(())
+        }
+
+        fn pruning_evaluation(
+            &self,
+            _row_range: &Range<u64>,
+            _expr: &Expression,
+            mask: Mask,
+        ) -> VortexResult<MaskFuture> {
+            // Return the mask unchanged if no pruning statistics are available.
+            Ok(MaskFuture::ready(mask))
+        }
+
+        fn filter_evaluation(
+            &self,
+            row_range: &Range<u64>,
+            expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<MaskFuture> {
+            // Issue I/O, evaluate expr, intersect with input mask.
+            todo!()
+        }
+
+        fn projection_evaluation(
+            &self,
+            row_range: &Range<u64>,
+            expr: &Expression,
+            mask: MaskFuture,
+        ) -> VortexResult<ArrayFuture> {
+            // Issue I/O, apply filter, evaluate projection expression.
+            todo!()
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Register your layout with a session">
+    Layout encodings are registered through `vortex_layout`'s session extension. Consult the `vortex-layout/src/session.rs` file for the current registration API, as it mirrors the array session pattern.
+
+    <Note>
+      The layout session registration API follows the same pattern as array encoding registration via `ArraySession::register`. Refer to the existing layout session code and built-in layout registrations for the exact call.
+    </Note>
+  </Step>
+</Steps>
+
+## The `FlatLayout` reference implementation
+
+`FlatLayout` in `vortex-layout/src/layouts/flat/` is the simplest complete layout. It:
+
+1. Holds a single `SegmentId` pointing to a serialized array on disk.
+2. Constructs a `FlatReader` that fetches the segment and deserializes the array.
+3. Evaluates filter and projection by slicing and applying expressions to the decoded array.
+
+Reading `flat/mod.rs` (the `VTable` impl) and `flat/reader.rs` (the `LayoutReader` impl) together is the fastest way to understand the expected structure.
+
+## Further reading
+
+- `vortex-layout/src/vtable.rs` — full `VTable` trait and `vtable!` macro
+- `vortex-layout/src/reader.rs` — `LayoutReader` trait definition
+- `vortex-layout/src/layouts/flat/` — `FlatLayout` reference implementation
+- `vortex-layout/src/layouts/chunked/` — `ChunkedLayout` for row-based chunking
+- [GitHub Discussions](https://github.com/vortex-data/vortex/discussions)

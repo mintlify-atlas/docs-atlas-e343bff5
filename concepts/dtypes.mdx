@@ -1,0 +1,101 @@
+---
+title: "DTypes: Vortex's Logical Type System"
+description: "Vortex DTypes are logical rather than physical — learn about primitives, structs, lists, and extension types that power Vortex's compressed computation model."
+---
+
+A core principle of Vortex is that its data types — called `DType`s — are _logical_ rather than _physical_. The dtype defines the domain of values an array may hold, but says nothing about how that data is actually stored in memory. A `u32` dtype represents an unsigned integer between `0` and `2^32 - 1` regardless of whether the underlying array is stored flat, dictionary-encoded, run-length encoded, or bit-packed.
+
+This separation between logical and physical representation is what enables Vortex's most powerful features — including performing compute directly on compressed data without first decompressing it.
+
+<Tip>
+  Vortex has no concept of a _schema_. Instead, it uses a struct dtype to represent columnar data. This means you can write a Vortex file containing a single integer array just as easily as one with many columns.
+</Tip>
+
+## Logical types
+
+Every DType can be marked as either **nullable** or **non-nullable**. Nullability is part of the type itself, not a separate field annotation as in Apache Arrow.
+
+| DType           | Domain                                        |
+|-----------------|-----------------------------------------------|
+| `Null`          | `null` only                                   |
+| `Bool`          | `true`, `false`                               |
+| `Primitive`     | Fixed-width numeric values (see below)        |
+| `Decimal`       | Fixed-precision real numbers                  |
+| `Utf8`          | Variable-length valid UTF-8 encoded strings   |
+| `Binary`        | Arbitrary variable-length bytes               |
+| `List`          | Variable-length sequences of an element type |
+| `FixedSizeList` | Fixed-length sequences of an element type    |
+| `Struct`        | Ordered collection of named fields            |
+| `Extension`     | User-defined types built on storage types     |
+
+<Note>
+  Some logical types are not yet supported, including fixed-length binary, maps, and variants. These may be added in future versions.
+</Note>
+
+## Primitive types
+
+The `Primitive` dtype is an enumeration of fixed-width numeric types. It is parameterized by a `PType` that selects the specific numeric format:
+
+| PType | Domain                  | Width  |
+|-------|-------------------------|--------|
+| `I8`  | 8-bit signed integer    | 1 byte |
+| `I16` | 16-bit signed integer   | 2 bytes |
+| `I32` | 32-bit signed integer   | 4 bytes |
+| `I64` | 64-bit signed integer   | 8 bytes |
+| `U8`  | 8-bit unsigned integer  | 1 byte |
+| `U16` | 16-bit unsigned integer | 2 bytes |
+| `U32` | 32-bit unsigned integer | 4 bytes |
+| `U64` | 64-bit unsigned integer | 8 bytes |
+| `F16` | IEEE 754-2008 half precision  | 2 bytes |
+| `F32` | IEEE 754-1985 single precision | 4 bytes |
+| `F64` | IEEE 754-1985 double precision | 8 bytes |
+
+For example, a `DType::Primitive(PType::I32, NonNullable)` represents a non-nullable 32-bit signed integer array — regardless of whether it is stored as a flat buffer, run-length encoded, or bit-packed in memory.
+
+## Composite types
+
+<AccordionGroup>
+  <Accordion title="List and FixedSizeList">
+    A `List` dtype has a single _element type_ — itself a logical dtype — and represents an array of variable-length sequences. For example, a list of strings has element type `Utf8`.
+
+    A `FixedSizeList` is similar, but every sequence in the array has the same fixed length. The element count per entry is part of the dtype itself.
+  </Accordion>
+
+  <Accordion title="Struct">
+    A `Struct` dtype is an ordered collection of named fields, each with its own dtype. Structs are how Vortex represents multi-column (tabular) data. There is no separate concept of a schema — a struct dtype _is_ the schema.
+
+    Fields may have different nullabilities from one another. Each field's dtype is independent, allowing a struct to mix integers, strings, lists, and nested structs.
+  </Accordion>
+
+  <Accordion title="Extension">
+    An `Extension` dtype is a user-defined logical type composed of an `id`, a `storage` dtype, and an optional `metadata` field. The id and metadata together may restrict the domain of the underlying storage dtype.
+
+    For example, a `vortex.date` type is logically stored as a `U32` representing the number of days since the Unix epoch. The storage dtype carries the physical data; the extension id and metadata give it semantic meaning.
+
+    Extension types allow Vortex to represent domain-specific types — such as timestamps, geospatial coordinates, or decimals with specific precision — without requiring changes to the core type system.
+  </Accordion>
+</AccordionGroup>
+
+## Nullability
+
+Every DType (except `Null`, which is always null) carries an explicit nullability marker: either `NonNullable` or `Nullable`. This is different from Apache Arrow, where nullability is a property of a `Field` rather than the type itself.
+
+```rust
+// Non-nullable 32-bit integer
+DType::Primitive(PType::I32, Nullability::NonNullable)
+
+// Nullable UTF-8 string
+DType::Utf8(Nullability::Nullable)
+```
+
+Non-nullable types allow Vortex to skip allocating or reading validity bitmaps, which saves both memory and I/O.
+
+## Differences from Apache Arrow
+
+Vortex dtypes are intentionally simpler and more uniform than Arrow's type system:
+
+- **Nullability** is part of the dtype in Vortex; in Arrow it belongs to a `Field`.
+- **No duplicate types** — Arrow has `string` and `large_string`, both representing UTF-8. Vortex has a single `Utf8`.
+- **Encodings are separate** — Arrow uses types like `dictionary` to describe physical layout. In Vortex, encodings are an entirely separate concept from dtypes.
+- **No first-class date/time types** — Timestamps and dates are represented as `Extension` dtypes built on primitive storage, keeping the core type system small.
+- **No schemas** — A struct dtype serves the same purpose, allowing columnar and non-columnar data to be described uniformly.

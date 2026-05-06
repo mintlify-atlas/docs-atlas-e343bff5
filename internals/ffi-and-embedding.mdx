@@ -1,0 +1,193 @@
+---
+title: "FFI, C/C++ Bindings, and GPU Support"
+description: "Embed Vortex in non-Rust projects using the C FFI, C++ wrapper, or Scan API. GPU-accelerated decoding via CUDA is available on Linux."
+---
+
+Vortex can be embedded into non-Rust applications and query engines through several integration paths: a C FFI, a C++ RAII wrapper, the Scan API for query engine integrations, and JNI bindings for the JVM. GPU-accelerated decompression is available on Linux via the `vortex-cuda` crate.
+
+<Warning>
+The embedding APIs are under active development. The C FFI is not yet ABI-stable and should be statically linked. Refer to the [Vortex GitHub Discussions](https://github.com/vortex-data/vortex/discussions) or Slack channel for guidance on production embeddings.
+</Warning>
+
+## Language Binding Tier Model
+
+Before diving into individual APIs, it helps to understand the capability tiers that govern what each binding exposes:
+
+| Tier | Name | Key Capabilities |
+|---|---|---|
+| 0 | Arrow I/O | Open/write files, import/export Arrow streams |
+| 1 | Scan API | Filter and projection pushdown, expression construction |
+| 2 | Native Arrays | Vortex array stream consumption, array tree inspection, compute execution |
+| 3 | Plugins | Register custom encodings, layouts, dtypes, and compute functions |
+
+Higher tiers are strict supersets of lower tiers. Rust has full Tier 3 access by definition. All other bindings target Tier 1 or 2 currently.
+
+## C FFI (`vortex-ffi`)
+
+The `vortex-ffi` crate generates a C header (`vortex.h`) via [cbindgen](https://github.com/mozilla/cbindgen). It is the **foundation ABI** for all non-Rust language bindings — the C++ wrapper, and eventually the Java Panama binding, all sit on top of it.
+
+### Current Capabilities (Tier ~1)
+
+- Session management: create and configure a `VortexSession` from C.
+- File I/O: open a `.vortex` file, read record batches via the Arrow C Data Interface.
+- Basic scan: apply filter expressions and projection lists.
+- Error handling: all functions return a `VortexError` struct with a status code and message string.
+
+### Linking
+
+The C API should be **statically linked** until an ABI-stable subset is declared. Build the shared or static library with Cargo and include the generated header:
+
+```bash
+cargo build -p vortex-ffi --release
+```
+
+The resulting `libvortex_ffi.a` (or `.so`) and `vortex.h` can then be linked from any C build system.
+
+### Memory Ownership
+
+Vortex follows a simple ownership model at the C boundary:
+
+- Functions that return pointers transfer ownership to the caller unless the name includes `_borrow`.
+- Callers must call the corresponding `vortex_*_free` function to release owned values.
+- Arrow C Data Interface exports use the standard Arrow `release` callback.
+
+<Tip>
+When embedding Vortex from C, always check the return code of every function before using any out-parameters. Vortex never returns a valid pointer alongside a non-zero status code.
+</Tip>
+
+## C++ Wrapper (`vortex-cxx`)
+
+The `vortex-cxx` crate provides a higher-level C++ API on top of the C FFI. It offers RAII wrappers for Vortex objects and CMake integration.
+
+### Current Capabilities (Tier ~1)
+
+The C++ wrapper currently mirrors the C FFI's capabilities: session management, file I/O via Arrow, and basic scan. The plan is to migrate from the [cxx](https://cxx.rs) interop model to wrapping the C API directly, targeting Tier 2.
+
+### CMake Integration
+
+Add the Vortex CMake package and link against the generated library:
+
+```cmake
+find_package(Vortex REQUIRED)
+target_link_libraries(my_target PRIVATE Vortex::vortex)
+```
+
+RAII wrappers ensure that Vortex objects are released correctly when they go out of scope — no manual `vortex_*_free` calls are needed from C++.
+
+## Scan API
+
+The Scan API is the primary integration point for query engines. It enables filter and projection pushdown without requiring the engine to understand Vortex's internal encoding formats. Results are returned as Arrow record batches, making this tier suitable for DataFusion, DuckDB, Spark, and Trino.
+
+### Scan Builder
+
+From Rust, a scan is constructed with `ScanBuilder`:
+
+```rust
+use vortex_scan::ScanBuilder;
+
+let scan = ScanBuilder::new(session.clone(), layout_reader)
+    .with_filter(expr)
+    .with_projection(columns)
+    .into_array_stream()?;
+```
+
+### Wire Format for Remote Execution
+
+For storage server integrations, scan requests and results are serialized using the IPC format defined in `vortex-ipc`. Each IPC message is framed as:
+
+```text
+[u32 flatbuffer length] [flatbuffer Message] [body bytes]
+```
+
+Three message types are defined:
+- **`ArrayMessage`** — a serialized array with row count and encoding context.
+- **`BufferMessage`** — a raw aligned buffer for transferring segments.
+- **`DTypeMessage`** — a serialized schema, sent before data transfer.
+
+Expressions can be serialized as protobuf bytes for transport across language boundaries, or constructed natively in any language that implements the Scan API.
+
+<Note>
+The IPC format is currently unstable. It does not yet support shared arrays (e.g. a dictionary shared across chunked arrays), which limits efficiency for some workloads. This is an area of active development.
+</Note>
+
+### Engine Integrations
+
+| Crate | Engine | Integration Type |
+|---|---|---|
+| `vortex-datafusion` | DataFusion | `TableProvider` and `FileFormat` |
+| `vortex-duckdb` | DuckDB | Table function via `CurrentThreadRuntime` |
+| `java/vortex-spark_*` | Spark | DataSource V2 via JNI |
+| `java/vortex-trino` | Trino | Connector (in development) |
+
+## JNI Bindings for Java (`vortex-jni`)
+
+The Java JNI bindings in `java/vortex-jni/` provide Tier ~1 capabilities for broad JDK compatibility:
+
+- Read and write Vortex files using Arrow Java.
+- Execute scans with filter and projection pushdown.
+- Return results as Arrow `VectorSchemaRoot` batches.
+
+JNI will remain at Tier 1 to maintain compatibility with older JDK LTS versions required by Spark. For JDK 22+ environments (Trino already qualifies), a **Java Panama** binding path is planned that calls the C API directly via `java.lang.foreign`, enabling Tier 2 capabilities without JNI overhead.
+
+## GPU / CUDA Support (`vortex-cuda`)
+
+The `vortex-cuda` crate provides GPU-accelerated decompression and compute for Vortex arrays. It is Linux-only (x86_64 and ARM64) and requires the NVIDIA CUDA Toolkit.
+
+### Build Requirements
+
+```bash
+# Requires CUDA 12.0+ and nvcc on PATH
+cargo build -p vortex-cuda --release
+```
+
+If `nvcc` is not available at build time, the crate compiles without PTX generation and GPU operations will fail at runtime with a descriptive error.
+
+### CudaSession
+
+`CudaSession` maintains a CUDA context, a registry of compiled kernels, and a pool of CUDA streams for concurrent execution. It follows the same session variable pattern as other Vortex components:
+
+```rust
+let session = CudaSession::try_new()?;
+let ctx = session.create_execution_ctx();
+```
+
+Kernels are compiled to PTX at build time via `nvcc`, embedded in the binary, and loaded lazily at first use. Multiple execution contexts can share a single session.
+
+### GPU-Accelerated Encodings
+
+| Encoding | Kernel |
+|---|---|
+| ALP | Floating-point decompression |
+| BitPacked | Bit unpacking (8/16/32/64-bit variants) |
+| Dictionary | Dictionary lookup |
+| DecimalByteParts | Decimal reconstruction |
+| Frame of Reference | FoR decompression |
+| Sequence | Sequence expansion |
+| ZigZag | ZigZag decoding |
+| ZSTD | GPU-accelerated decompression via nvCOMP |
+
+Additional kernels exist for filter, slice, and patch operations.
+
+### Deferred Execution on the GPU
+
+GPU execution integrates with Vortex's deferred execution model. When a `ScalarFnArray` tree is executed on the GPU:
+
+1. The tree is traversed to identify operations with registered GPU kernels.
+2. Compatible subtrees are batched into a single GPU execution plan.
+3. The plan is executed with kernel fusion where possible, reducing memory traffic and kernel launch overhead.
+4. Results are returned as `CudaDeviceBuffer` handles that can remain on-device for further computation.
+
+This batching is why deferral matters for GPU performance — eager execution would launch many small kernels with host-device synchronization between each, while deferred execution can fuse the entire expression tree into fewer, larger launches.
+
+### Interoperability
+
+Vortex arrays with on-device buffer handles can be converted to Apache Arrow `DeviceArray` format for interoperability with other GPU libraries. An `ArrayStream` of GPU-executed Vortex arrays can be exported as Arrow `DeviceArray` records without copying data back to host memory.
+
+### NVIDIA Library Dependencies
+
+- **nvCOMP** — GPU-accelerated ZSTD decompression. Bindings in `vortex-cuda/nvcomp` dynamically load `libnvcomp.so` at runtime (Linux only).
+- **CUB** — CUDA Unbound primitives. Vortex uses `DeviceSelect` for GPU-side filter operations. The `vortex-cuda/cub` crate compiles a thin wrapper loaded at runtime.
+
+## WASM Support
+
+On `wasm32-unknown-unknown` targets, the standard file and thread-blocking APIs are unavailable. The `vortex-io` crate uses `#[cfg(not(target_arch = "wasm32"))]` to exclude `std_file` and thread-based runtime modules, and provides a browser-compatible executor via `vortex-io::runtime::wasm` instead. CUDA support is not available on WASM targets.

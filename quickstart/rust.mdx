@@ -1,0 +1,263 @@
+---
+title: "Rust Quickstart"
+description: "Learn how to add the vortex crate to your Rust project, write compressed .vortex files with async Tokio, and read them back with filter and projection pushdown."
+---
+
+The `vortex` crate is the main entry point for the Vortex library in Rust. It re-exports all sub-crates—array types, encodings, file IO, the session system, and more—through a single dependency. Reading and writing Vortex files is async and built on Tokio.
+
+<Steps>
+
+<Step title="Add the vortex crate">
+
+Add `vortex` to your `Cargo.toml`:
+
+```bash
+cargo add vortex
+```
+
+For file IO (reading and writing `.vortex` files), enable the `files` feature:
+
+```bash
+cargo add vortex --features files
+```
+
+For async file operations, you also need `tokio`:
+
+```bash
+cargo add tokio --features full
+```
+
+Your `Cargo.toml` dependencies section will look like:
+
+```toml
+[dependencies]
+vortex = { version = "*", features = ["files"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+<Tip>
+  For optimal runtime performance, consider enabling [MiMalloc](https://github.com/microsoft/mimalloc) as your global allocator:
+
+  ```rust
+  #[global_allocator]
+  static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+  ```
+
+  Add `mimalloc = "*"` to your dependencies.
+</Tip>
+
+</Step>
+
+<Step title="Create a VortexSession">
+
+All Vortex operations flow through a `VortexSession`. Use `VortexSessionDefault::default()` to create one with all standard array encodings, layout strategies, scalar functions, aggregate functions, and async runtime support pre-registered:
+
+```rust
+use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
+
+let session = VortexSession::default();
+```
+
+The session is cheap to clone and can be shared across threads. It acts as the registry for every extensible component in Vortex—encodings, compressors, expression evaluators, and IO backends.
+
+</Step>
+
+<Step title="Write arrays to a Vortex file">
+
+Use `session.write_options().write()` to serialize a `PrimitiveArray` (or any array) to a file. Writing is async and requires a Tokio runtime:
+
+```rust
+use std::path::PathBuf;
+
+use vortex::array::arrays::PrimitiveArray;
+use vortex::array::IntoArray;
+use vortex::array::stream::ArrayStreamExt;
+use vortex::buffer::buffer;
+use vortex::array::validity::Validity;
+use vortex::file::WriteOptionsSessionExt;
+use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let session = VortexSession::default();
+
+    // Create a simple primitive array
+    let array = PrimitiveArray::new(buffer![0u64, 1, 2, 3, 4], Validity::NonNullable);
+
+    // Write it to disk using the default BtrBlocks compression strategy
+    let path = PathBuf::from("example.vortex");
+    session
+        .write_options()
+        .write(
+            &mut tokio::fs::File::create(&path).await?,
+            array.into_array().to_array_stream(),
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+**Using the compact (more aggressive) compression strategy**
+
+```rust
+use vortex::file::{WriteOptionsSessionExt, WriteStrategyBuilder};
+use vortex::compressor::BtrBlocksCompressorBuilder;
+
+session
+    .write_options()
+    .with_strategy(
+        WriteStrategyBuilder::default()
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+            .build(),
+    )
+    .write(
+        &mut tokio::fs::File::create("example_compact.vortex").await?,
+        array.into_array().to_array_stream(),
+    )
+    .await?;
+```
+
+</Step>
+
+<Step title="Read with filter and projection pushdown">
+
+Use `session.open_options().open_path()` to open a file, then call `.scan()` to build a lazy scan. Attach filter expressions with `.with_filter()` and projection expressions with `.with_projection()` before materializing:
+
+```rust
+use vortex::array::expr::{gt, lit, root};
+use vortex::file::OpenOptionsSessionExt;
+
+// Read the file back, keeping only rows where the value is > 2
+let array = session
+    .open_options()
+    .open_path(path.clone())
+    .await?
+    .scan()?
+    .with_filter(gt(root(), lit(2u64)))
+    .into_array_stream()?
+    .read_all()
+    .await?;
+
+assert_eq!(array.len(), 2); // values 3 and 4
+```
+
+**Projection pushdown** — read only selected columns from a struct array:
+
+```rust
+use vortex::array::arrays::StructArray;
+use vortex::array::dtype::FieldNames;
+use vortex::array::expr::{root, select};
+
+// Build a two-column struct array: { id: u64, value: u64 }
+let ids    = PrimitiveArray::new(buffer![1u64, 2, 3, 4, 5], Validity::NonNullable);
+let values = PrimitiveArray::new(buffer![10u64, 20, 30, 40, 50], Validity::NonNullable);
+
+let array = StructArray::try_new(
+    FieldNames::from(["id", "value"]),
+    vec![ids.into_array(), values.into_array()],
+    5,
+    Validity::NonNullable,
+)?
+.into_array();
+
+// Write it
+let path = PathBuf::from("example_projection.vortex");
+session
+    .write_options()
+    .write(
+        &mut tokio::fs::File::create(&path).await?,
+        array.to_array_stream(),
+    )
+    .await?;
+
+// Read back only the "value" column
+let projected = session
+    .open_options()
+    .open_path(path.clone())
+    .await?
+    .scan()?
+    .with_projection(select(["value"], root()))
+    .into_array_stream()?
+    .read_all()
+    .await?;
+
+assert_eq!(projected.len(), 5);
+```
+
+</Step>
+
+<Step title="In-memory compression">
+
+You can also compress arrays in-memory without writing to disk—useful for benchmarking or embedding Vortex in a larger system:
+
+```rust
+use vortex::array::arrays::PrimitiveArray;
+use vortex::array::IntoArray;
+use vortex::array::validity::Validity;
+use vortex::buffer::buffer;
+use vortex::compressor::BtrBlocksCompressor;
+use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
+
+let session = VortexSession::default();
+let array = PrimitiveArray::new(buffer![42u64; 100_000], Validity::NonNullable);
+
+let compressed = BtrBlocksCompressor::default().compress(
+    &array.clone().into_array(),
+    &mut session.create_execution_ctx(),
+)?;
+
+println!(
+    "BtrBlocks size: {} / {}",
+    compressed.nbytes(),
+    array.into_array().nbytes()
+);
+```
+
+</Step>
+
+<Step title="Convert from Parquet">
+
+Use the `parquet` and `arrow` crates to read a Parquet file, then wrap the Arrow record batches as Vortex arrays using `ArrayRef::from_arrow`:
+
+```rust
+use std::fs::File;
+
+use arrow_array::RecordBatchReader;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use vortex::array::arrays::ChunkedArray;
+use vortex::array::arrow::FromArrowArray;
+use vortex::array::ArrayRef;
+use vortex::array::IntoArray;
+use vortex::dtype::DType;
+use vortex::dtype::arrow::FromArrowType;
+
+let reader = ParquetRecordBatchReaderBuilder::try_new(
+    File::open("yellow_tripdata_2024-01.parquet")?
+)?
+.build()?;
+
+let dtype = DType::from_arrow(reader.schema());
+let chunks: Vec<_> = reader
+    .map(|record_batch| {
+        let batch = record_batch?;
+        Ok(ArrayRef::from_arrow(batch, false))
+    })
+    .collect::<anyhow::Result<_>>()?;
+
+let vortex_array = ChunkedArray::try_new(chunks, dtype)?.into_array();
+```
+
+</Step>
+
+</Steps>
+
+## Next Steps
+
+- [Python Quickstart](/quickstart/python) — Python bindings with scan and filter pushdown
+- [Java Quickstart](/quickstart/java) — Spark connector and JNI bindings
+- [Introduction](/introduction) — architecture overview and performance benchmarks
+- [API docs on docs.rs](https://docs.rs/vortex) — full Rust API reference

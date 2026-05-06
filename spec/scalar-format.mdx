@@ -1,0 +1,140 @@
+---
+title: "Scalar Serialization Format"
+description: "Vortex scalar values are serialized as Protocol Buffer Scalar messages with an embedded DType, used in statistics, expression literals, and IPC messages."
+---
+
+A Vortex scalar is a typed single value — the runtime analog of a `DType`. Scalars appear in statistics (min, max, sum stored per array), in expression literals, and in any other context where a single typed value must be serialized. Scalars are serialized using **Protocol Buffers** via the `vortex.scalar` package.
+
+## Wire format
+
+The top-level `Scalar` message pairs a `DType` with a `ScalarValue`, making every serialized scalar self-describing:
+
+```protobuf
+// vortex-proto/proto/scalar.proto
+
+syntax = "proto3";
+package vortex.scalar;
+
+import "dtype.proto";
+import "google/protobuf/struct.proto";
+
+message Scalar {
+  vortex.dtype.DType dtype = 1;
+  ScalarValue        value = 2;
+}
+```
+
+### ScalarValue
+
+`ScalarValue` is a `oneof` that covers every value kind supported by the Vortex type system:
+
+```protobuf
+message ScalarValue {
+  oneof kind {
+    google.protobuf.NullValue null_value   = 1;
+    bool                      bool_value   = 2;
+    sint64                    int64_value  = 3;
+    uint64                    uint64_value = 4;
+    float                     f32_value    = 5;
+    double                    f64_value    = 6;
+    string                    string_value = 7;
+    bytes                     bytes_value  = 8;
+    ListValue                 list_value   = 9;
+    uint64                    f16_value    = 10;
+    Scalar                    variant_value = 11;
+  }
+}
+
+message ListValue {
+  repeated ScalarValue values = 1;
+}
+```
+
+### Value kinds by DType
+
+| `DType` | `ScalarValue` field | Notes |
+|---|---|---|
+| `Null` | `null_value` | `google.protobuf.NullValue` (always `NULL_VALUE = 0`) |
+| `Bool` | `bool_value` | Proto native `bool` |
+| `Primitive` (unsigned int) | `uint64_value` | All unsigned integers widened to `uint64` |
+| `Primitive` (signed int) | `int64_value` | All signed integers widened to `sint64` (zigzag-encoded) |
+| `Primitive` (F16) | `f16_value` | Raw bit pattern stored as `uint64` |
+| `Primitive` (F32) | `f32_value` | Proto native `float` |
+| `Primitive` (F64) | `f64_value` | Proto native `double` |
+| `Utf8` | `string_value` | Proto native `string` (UTF-8) |
+| `Binary` | `bytes_value` | Proto native `bytes` |
+| `List` / `FixedSizeList` / `Struct_` | `list_value` | Recursive `ListValue` of child `ScalarValue`s |
+| `Variant` | `variant_value` | Nested `Scalar` with its own embedded `DType` |
+| `Decimal` | `int64_value` | Unscaled integer value as `sint64` |
+| Null scalar (any nullable type) | `null_value` | `null_value` may appear for any nullable `DType` |
+
+<Note>
+  F16 values are stored as a `uint64` containing the raw 16-bit IEEE 754 bit pattern. The `DType` field of the enclosing `Scalar` indicates that interpretation is as F16.
+</Note>
+
+## Null handling
+
+A scalar is null when `ScalarValue.kind` is set to `null_value`. The `DType` of the enclosing `Scalar` still identifies the type; nullability is carried by the `nullable` field of the `DType` (see [DType Serialization Format](/spec/dtype-format)).
+
+A `ScalarValue` with no `kind` set (the proto default, field number 0) is also treated as null.
+
+## Scalars in statistics
+
+Array statistics are stored as serialized `Scalar` bytes inside the `ArrayStats` FlatBuffer table. Each statistics field that holds a scalar (min, max, sum) stores a proto-serialized `ScalarValue` byte slice:
+
+```text
+// vortex-flatbuffers/flatbuffers/vortex-array/array.fbs
+
+table ArrayStats {
+    min:                        [ubyte];  // proto-serialized ScalarValue
+    min_precision:              Precision;
+    max:                        [ubyte];  // proto-serialized ScalarValue
+    max_precision:              Precision;
+    sum:                        [ubyte];  // proto-serialized ScalarValue
+    is_sorted:                  bool = null;
+    is_strict_sorted:           bool = null;
+    is_constant:                bool = null;
+    null_count:                 uint64 = null;
+    uncompressed_size_in_bytes: uint64 = null;
+    nan_count:                  uint64 = null;
+}
+
+enum Precision: uint8 {
+    Inexact = 0,
+    Exact   = 1,
+}
+```
+
+The `Precision` enum distinguishes between statistics that are exact (e.g., computed directly from data) and those that are inexact (e.g., propagated through a lossy encoding). The `DType` for the statistics values is inferred from the array's own `DType`; it is not re-encoded inside each `[ubyte]` field.
+
+## Scalars in expressions
+
+Expressions use the `vortex.expr.LiteralOpts` proto message to embed scalar values:
+
+```protobuf
+// vortex-proto/proto/expr.proto
+
+message Expr {
+  string        id       = 1;
+  repeated Expr children = 2;
+  optional bytes metadata = 3;
+}
+
+// Options for `vortex.literal`
+message LiteralOpts {
+  vortex.scalar.Scalar value = 1;
+}
+```
+
+A literal expression has `id = "vortex.literal"` and serializes its `LiteralOpts` into the `Expr.metadata` field as proto bytes. The full `Scalar` message (with embedded `DType`) is stored, making literal expressions self-describing regardless of the surrounding expression context.
+
+## Variant scalars
+
+The `Variant` scalar kind supports semi-structured data where each row may carry a value of a different type. A `Variant` scalar is represented as a nested `Scalar` message:
+
+```protobuf
+// variant_value carries the row-specific typed scalar
+Scalar variant_value = 11;
+```
+
+The nested `Scalar` includes its own `DType`, allowing each variant value to be independently typed. See [RFC 0015](https://github.com/vortex-data/rfcs/blob/develop/accepted/0015-variant-type.md) for the full specification of the `Variant` type.
